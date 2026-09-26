@@ -1,8 +1,8 @@
 --[[================================================================================
-CHINASIDE TYCOON — AUTO HUB
+CHINASIDE TYCOON — AUTO HUB  (v1.1)
 Game:   ChinaSide Tycoon by Goyboy Games (Roblox)
 Place:  88793580588296   Universe: 10764967952
-Build:  1.0 (researched 2026-09-26)
+Build:  1.1 — universal interaction core
 
 RESEARCH — HOW THE GAME WORKS
 --------------------------------------------------------------------------------
@@ -15,50 +15,48 @@ loop, from the official description, codes pages and creator guides:
   * You PROCESS ORDERS (pack / label) and then SHIP HAULS — each shipped haul
     pays out cash.
   * You HIRE staff: packers, photographers, forklift drivers, security.
-    More staff = more of the loop runs without you; security reduces raid risk.
-  * You can open a FACTORY (conveyors, produce your own stock) — a mid-game
-    money sink that raises margins.
-  * Police RAIDS happen periodically; you can fight the risk with security or
-    PAY A BRIBE when a raid hits.
-  * Star rating + followers = more customers; crates are a luck/reward mechanic.
+  * You can open a FACTORY (conveyors, produce your own stock).
+  * Police RAIDS happen periodically; fight the risk with security or PAY A
+    BRIBE when a raid hits.
+  * Star rating + followers = more customers; crates are a luck mechanic.
   * Earnings accrue OFFLINE (claim on rejoin).
-  * Codes are redeemed in: Shop -> Codes tab -> paste -> Redeem.
+  * Codes: Shop -> Codes tab -> paste -> Redeem.
 
 Working codes at research time: 5klikes, followers67, FREE, 250likes, charts,
 pikobuy, tiktok, repempire
 
-DESIGN OF THIS SCRIPT
+WHAT CHANGED IN v1.1 ("nothing works" fix)
 --------------------------------------------------------------------------------
-The game has no published script and is only weeks old, so nothing is hard
-coded to internals. Everything is discovered at runtime:
+v1.0 only triggered ProximityPrompts. Tycoon games usually drive their main
+loop with other mechanisms, so v1.0 could find nothing to do. v1.1 interacts
+through EVERY common mechanism at once:
 
-  * Base finder      — attributes / names / plot folders -> your tycoon
-  * Prompt discovery — every ProximityPrompt in your base, bucketed by action
-                       (photo / order / ship / collect / hire / crate / raid)
-  * Movement         — walk the character to stations, trigger prompts the
-                       same way the game does (InputHoldBegin/End)
-  * UI actions       — code redemption and raid bribe buttons are pressed with
-                       VirtualInputManager screen clicks (guarded, degrades
-                       honestly if unavailable)
-  * Scanner          — the SCAN button dumps what it found so missing pieces
-                       are visible instead of silent
+  1. ProximityPrompts  — trigger the same way a keypress would (walk up to it)
+  2. ClickDetectors    — walk in range, face the part, screen-click it
+  3. GUI workflow      — visible buttons in the game's own UI whose text
+                         matches the loop (photo/qc, process, pack, ship,
+                         deliver, collect, claim, bribe...) get clicked
+  4. Station parts     — keyword-named parts (PhotoTable, ShipDesk...) get
+                         walked onto (Touched pads) and interacted with (E)
+  5. Cash pads         — walk over anchored cash/claim parts
+  6. Teleport option   — hop directly next to a station when it is far away,
+                         so walls/pathfinding can never strand the route
 
-Features (toggle in the GUI):
-  Auto QC Photos | Auto Process Orders | Auto Ship Hauls | Auto Collect
-  Auto Hire Staff (off by default) | Auto Raid Bribe (on) | Auto Open Crates
-  (off by default) | Walk Speed | Anti-AFK
-Actions:
-  SCAN | REDEEM CODES | BRIBE NOW | UNLOAD
+Discovery is also distance-scoped now: if the base cannot be identified by
+owner attributes/names, targets are picked within 160 studs of you instead of
+doing nothing. The status line shows live counts of every target kind, so
+"nothing works" is always diagnosable at a glance (or use the SCAN button).
 
-Run in any Roblox executor. Client-side automation only: no anti-cheat
-bypass, no remote argument guessing, no server manipulation. Playing this
-way may violate the game's terms — your account, your call.
+Design rules: client-side only — no anti-cheat bypass, no remote argument
+guessing, no server manipulation. Keyword remotes are reported by SCAN but
+never fired. Playing this way may violate the game's terms — your account.
 ================================================================================]]
 
 local Players            = game:GetService("Players")
 local Workspace          = game:GetService("Workspace")
 local RunService         = game:GetService("RunService")
 local UserInputService   = game:GetService("UserInputService")
+local GuiService         = game:GetService("GuiService")
 local ReplicatedStorage  = game:GetService("ReplicatedStorage")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local LocalPlayer        = Players.LocalPlayer
@@ -77,38 +75,53 @@ local KNOWN_CODES = {
 }
 
 local BUCKET_PATTERNS = {
-    photo   = { "photo", "qc", "camera", "shoot", "snapshot", "quality" },
-    order   = { "order", "process", "pack", "label", "sort", "fulfil", "fulfill" },
-    ship    = { "ship", "haul", "deliver", "dispatch", "send", "van", "truck" },
-    collect = { "collect", "cash", "money", "claim", "earn", "pickup", "pick up",
-                "revenue", "offline", "sale", "sell", "income", "payout" },
-    hire    = { "hire", "employ", "recruit", "staff", "worker" },
-    crate   = { "crate", "unbox", "open", "spin", "roll", "gacha" },
     raid    = { "bribe", "raid", "police", "officer", "fine", "pay off", "bail" },
+    photo   = { "photo", "qc", "camera", "shoot", "snapshot", "quality", "capture" },
+    order   = { "order", "process", "pack", "label", "sort", "fulfil", "fulfill" },
+    ship    = { "ship", "haul", "deliver", "dispatch", "send", "van", "truck", "depart" },
+    collect = { "collect", "cash", "money", "claim", "earn", "pickup", "pick up",
+                "revenue", "offline", "sale", "sell", "income", "payout", "next" },
+    hire    = { "hire", "employ", "recruit", "staff", "worker" },
+    crate   = { "crate", "unbox", "spin", "roll", "gacha" },
+}
+
+local BUCKET_ORDER = { "raid", "photo", "order", "ship", "collect", "hire", "crate" }
+
+local WORKFLOW_EXCLUDE = {
+    "robux", "purchase", "buy", "gamepass", "shop", "store", "cancel", "close",
+    "delete", "settings", "social", "group", "codes", "redeem", "inventory",
+    "equip", "roblox", "premium", "avatar",
 }
 
 local Config = {
     ScanInterval      = 2.0,
     PromptCooldown    = 0.35,
     PerPromptCooldown = 1.0,
+    GuiTargetCooldown = 2.5,
     MoveTimeout       = 9.0,
-    TriggerDistance   = 10,
+    TriggerDistance   = 12,
     TickRate          = 0.25,
     WalkSpeed         = 32,
+    TeleportDistance  = 22,
+    TeleportGap       = 0.7,
+    NearRangeNoBase   = 160,
+    NearRangeBase     = 90,
 }
 
 local State = {
     Running   = true,
     Base      = nil,
     BaseWhy   = "scanning...",
-    Prompts   = { photo={}, order={}, ship={}, collect={}, hire={}, crate={}, raid={} },
+    Targets   = { photo={}, order={}, ship={}, collect={}, hire={}, crate={}, raid={} },
     ScanAt    = 0,
     ScanCount = 0,
+    Busy      = false,
     GuiParts  = { shop=nil, codesTab=nil, codeBox=nil, redeem=nil, bribe=nil },
     Cooldowns = {},
     LastTrigger = {},
     SpeedApplied = false,
     SavedSpeed = 16,
+    LastTeleport = 0,
     Features = {
         photo   = true,
         order   = true,
@@ -118,9 +131,11 @@ local State = {
         crate   = false,
         raid    = true,
         speed   = false,
+        tp      = true,
         antiafk = true,
     },
     Stats = { photos=0, orders=0, ships=0, collected=0, hired=0, bribed=0, crates=0 },
+    Counts = { prompt=0, click=0, key=0, gui=0 },
 }
 
 local LogLines = {}
@@ -187,6 +202,24 @@ local function matchAny(text, patterns)
     return false
 end
 
+local function inHubGui(inst)
+    local node = inst
+    while node and node ~= game do
+        if node.Name == HUB_NAME then return true end
+        node = node.Parent
+    end
+    return false
+end
+
+local function bucketForText(text)
+    for _, key in ipairs(BUCKET_ORDER) do
+        if matchAny(text, BUCKET_PATTERNS[key]) then
+            return key
+        end
+    end
+    return nil
+end
+
 --------------------------------------------------------------------------------
 -- character
 --------------------------------------------------------------------------------
@@ -238,50 +271,13 @@ local function distanceTo(inst)
     return (root.Position - pos).Magnitude
 end
 
+local function isCharacterModel(model)
+    return model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
 --------------------------------------------------------------------------------
--- prompt discovery + base discovery
+-- base discovery
 --------------------------------------------------------------------------------
-
-local function promptLabel(p)
-    return lower(table.concat({ tostring(p.Name), tostring(p.ActionText), tostring(p.ObjectText) }, " "))
-end
-
-local function bucketFor(p)
-    local text = promptLabel(p)
-    local order = { "raid", "photo", "order", "ship", "collect", "hire", "crate" }
-    for _, key in ipairs(order) do
-        if matchAny(text, BUCKET_PATTERNS[key]) then
-            return key
-        end
-    end
-    return nil
-end
-
-local function clearPrompts()
-    for _, list in pairs(State.Prompts) do
-        table.clear(list)
-    end
-end
-
-local function scanPrompts(container)
-    clearPrompts()
-    local total = 0
-    for _, d in ipairs(container:GetDescendants()) do
-        if d:IsA("ProximityPrompt") and d.Enabled then
-            local bucket = bucketFor(d)
-            if bucket then
-                table.insert(State.Prompts[bucket], d)
-                total = total + 1
-            end
-        end
-    end
-    for _, list in pairs(State.Prompts) do
-        table.sort(list, function(a, b)
-            return distanceTo(a) < distanceTo(b)
-        end)
-    end
-    return total
-end
 
 local function modelOwnerMatch(model)
     local userId = tostring(LocalPlayer.UserId)
@@ -304,10 +300,6 @@ local function modelOwnerMatch(model)
         return true
     end
     return false
-end
-
-local function isCharacterModel(model)
-    return model:FindFirstChildOfClass("Humanoid") ~= nil
 end
 
 local function findBase()
@@ -340,41 +332,168 @@ local function findBase()
     return nil, "no owner match found"
 end
 
-local function rescan()
+--------------------------------------------------------------------------------
+-- target discovery: prompts, click detectors, station parts, GUI buttons
+--------------------------------------------------------------------------------
+
+local function clearTargets()
+    for _, list in pairs(State.Targets) do
+        table.clear(list)
+    end
+    State.Counts = { prompt=0, click=0, key=0, gui=0 }
+end
+
+local function addRecord(bucket, kind, inst, range)
+    local rec = { kind = kind, inst = inst, bucket = bucket, range = range or 10 }
+    table.insert(State.Targets[bucket], rec)
+    State.Counts[kind] = (State.Counts[kind] or 0) + 1
+    return rec
+end
+
+local function inBaseScope(inst)
+    local base = State.Base
+    if base then
+        return base:IsAncestorOf(inst)
+    end
+    local root = getRoot()
+    local pos = positionOf(inst)
+    if not root or not pos then
+        return false
+    end
+    return (root.Position - pos).Magnitude <= Config.NearRangeNoBase
+end
+
+local function stationPartFilter(name)
+    return matchAny(name, { "station", "desk", "table", "terminal", "console",
+        "kiosk", "booth", "workstation", "machine", "console", "pad", "button" })
+end
+
+local function rescanTargets()
     State.ScanCount = State.ScanCount + 1
+    local hadBase = State.Base ~= nil
     local base, why = findBase()
-    local container = base or Workspace
-    local changed = (base ~= State.Base)
     State.Base = base
     State.BaseWhy = why or "unknown"
-    local count = scanPrompts(container)
-    if not base then
-        count = scanPrompts(Workspace)
+    clearTargets()
+
+    for key, untilTime in pairs(State.Cooldowns) do
+        if typeof(key) == "Instance" then
+            if key.Parent == nil or now() >= untilTime then
+                State.Cooldowns[key] = nil
+            end
+        end
     end
-    State.ScanAt = now()
-    if changed then
-        addLog(base and ("base: " .. base:GetName() .. " (" .. why .. ")")
-                  or ("base not found (" .. tostring(why) .. "); scanning workspace"))
-    end
-    if State.ScanCount == 1 then
-        addLog(("scan #%d: %d prompts in %s"):format(
-            State.ScanCount, count, base and base:GetName() or "Workspace"))
-    end
-    for key, at in pairs(State.LastTrigger) do
-        if typeof(key) == "Instance" and (now() - at > 60 or key.Parent == nil) then
+    for key, time in pairs(State.LastTrigger) do
+        if typeof(key) == "Instance" and key.Parent == nil then
             State.LastTrigger[key] = nil
         end
     end
-    for key, at in pairs(State.Cooldowns) do
-        if typeof(key) == "Instance" and (key.Parent == nil or now() > at) then
-            State.Cooldowns[key] = nil
+
+    local worldRecords = {}
+
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Enabled then
+            local text = lower(table.concat({
+                tostring(d.Name), tostring(d.ActionText), tostring(d.ObjectText) }, " "))
+            local bucket = bucketForText(text)
+            if bucket and inBaseScope(d) then
+                local range = math.clamp((d.MaxActivationDistance or 10) + 2, 6, 18)
+                worldRecords[#worldRecords + 1] = addRecord(bucket, "prompt", d, range)
+            end
+        elseif d:IsA("ClickDetector") and d.Enabled then
+            local parent = d.Parent
+            if parent and not isCharacterModel(parent) then
+                local text = lower(parent.Name)
+                local node = parent.Parent
+                for _ = 1, 2 do
+                    if node and node ~= Workspace then
+                        text = text .. " " .. lower(node.Name)
+                        node = node.Parent
+                    end
+                end
+                local bucket = bucketForText(text)
+                if bucket and inBaseScope(parent) then
+                    local range = math.clamp((d.MaxActivationDistance or 32) + 3, 8, 20)
+                    worldRecords[#worldRecords + 1] = addRecord(bucket, "click", parent, range)
+                end
+            end
+        elseif d:IsA("BasePart") and stationPartFilter(d.Name) and inBaseScope(d) then
+            local bucket = bucketForText(d.Name)
+            if bucket then
+                worldRecords[#worldRecords + 1] = addRecord(bucket, "key", d, 9)
+            end
         end
     end
-    return count
+
+    for _, rec in ipairs(worldRecords) do
+        if rec.kind == "key" then
+            local pos = positionOf(rec.inst)
+            if pos then
+                for _, other in ipairs(worldRecords) do
+                    if other.kind ~= "key" and other.kind ~= "removed"
+                        and other.bucket == rec.bucket then
+                        local p2 = positionOf(other.inst)
+                        if p2 and (pos - p2).Magnitude < 4 then
+                            rec.kind = "removed"
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+    for i = #worldRecords, 1, -1 do
+        if worldRecords[i].kind == "removed" then
+            table.remove(worldRecords, i)
+        end
+    end
+    for _, list in pairs(State.Targets) do
+        for i = #list, 1, -1 do
+            if list[i].kind == "removed" then
+                table.remove(list, i)
+                State.Counts.key = math.max(0, State.Counts.key - 1)
+            end
+        end
+    end
+
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if playerGui then
+        for _, gui in ipairs(playerGui:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui.Name ~= HUB_NAME and gui.Enabled then
+                for _, d in ipairs(gui:GetDescendants()) do
+                    if (d:IsA("TextButton") or d:IsA("ImageButton")) and guiVisible(d) then
+                        local text = d:IsA("TextButton")
+                            and (lower(d.Text) .. " " .. lower(d.Name))
+                            or lower(d.Name)
+                        if not matchAny(text, WORKFLOW_EXCLUDE) then
+                            local bucket = bucketForText(text)
+                            if bucket then
+                                addRecord(bucket, "gui", d, 0)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for _, list in pairs(State.Targets) do
+        table.sort(list, function(a, b)
+            return distanceTo(a.inst) < distanceTo(b.inst)
+        end)
+    end
+
+    State.ScanAt = now()
+    if State.ScanCount == 1 or hadBase ~= (base ~= nil) then
+        addLog(base and ("base: " .. base:GetName() .. " (" .. why .. ")")
+                  or ("base not found (" .. tostring(why) .. "); using nearby scan"))
+        addLog(("targets: %d prompts, %d click, %d stations, %d gui buttons"):format(
+            State.Counts.prompt, State.Counts.click, State.Counts.key, State.Counts.gui))
+    end
 end
 
 --------------------------------------------------------------------------------
--- discovery: screen UI (shop / codes / bribe)
+-- screen UI discovery (shop / codes / bribe)
 --------------------------------------------------------------------------------
 
 local function findGuiObjects()
@@ -392,11 +511,10 @@ local function findGuiObjects()
                     if not g.shop and matchAny(t, { "shop", "store" }) and guiVisible(d) then
                         g.shop = d
                     end
-                    if not g.codesTab and matchAny(t, { "code", "redeem" }) and guiVisible(d) then
+                    if not g.codesTab and matchAny(t, { "code" }) and guiVisible(d) then
                         g.codesTab = d
                     end
-                    if not g.redeem and matchAny(t, { "redeem", "claim", "submit" })
-                        and guiVisible(d) and not matchAny(t, { "code tab" }) then
+                    if not g.redeem and matchAny(t, { "redeem" }) and guiVisible(d) then
                         g.redeem = d
                     end
                     if not g.bribe and matchAny(t, { "bribe", "pay off", "payoff", "bail" })
@@ -414,16 +532,13 @@ local function findGuiObjects()
     end
 end
 
-local function inHubGui(inst)
-    local node = inst
-    while node and node ~= game do
-        if node.Name == HUB_NAME then return true end
-        node = node.Parent
-    end
-    return false
-end
-
+local lastRaidCheck, raidVisibleCache = 0, false
 local function raidGuiVisible()
+    if now() - lastRaidCheck < 0.6 then
+        return raidVisibleCache
+    end
+    lastRaidCheck = now()
+    raidVisibleCache = false
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return false end
     for _, gui in ipairs(playerGui:GetDescendants()) do
@@ -432,23 +547,23 @@ local function raidGuiVisible()
             local t = lower(gui.Text)
             if (string.find(t, "raid", 1, true) or string.find(t, "police", 1, true)
                 or string.find(t, "busted", 1, true)) and guiVisible(gui) then
-                return true
+                raidVisibleCache = true
+                break
             end
         end
     end
-    return false
+    return raidVisibleCache
 end
 
 --------------------------------------------------------------------------------
--- interaction: prompts, movement, UI clicks
+-- interaction: prompts, screen clicks, keys, movement, teleport
 --------------------------------------------------------------------------------
 
 local function triggerPrompt(p)
     if not p or not p.Parent then return false end
-    local key = p
-    local last = State.LastTrigger[key] or 0
+    local last = State.LastTrigger[p] or 0
     if now() - last < Config.PerPromptCooldown then return false end
-    State.LastTrigger[key] = now()
+    State.LastTrigger[p] = now()
 
     local originalHold = p.HoldDuration
     local ok = pcall(function()
@@ -467,17 +582,25 @@ local function triggerPrompt(p)
     return false
 end
 
-local function moveTo(targetPos)
-    local humanoid = getHumanoid()
-    local root = getRoot()
-    if not humanoid or not root or not targetPos then return false end
-    if humanoid.Health <= 0 then return false end
-    humanoid:MoveTo(targetPos)
-    return true
-end
-
 local function vimAvailable()
     return typeof(VirtualInputManager) == "Instance"
+end
+
+local function uiClickAt(x, y)
+    if not vimAvailable() then return false end
+    local ok = pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+        task.wait(0.06)
+        VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+    end)
+    if ok then return true end
+    local ok2 = pcall(function()
+        local vu = game:GetService("VirtualUser")
+        vu:Button1Down(Vector2.new(x, y))
+        task.wait(0.06)
+        vu:Button1Up(Vector2.new(x, y))
+    end)
+    return ok2
 end
 
 local function screenCenter(obj)
@@ -488,112 +611,224 @@ end
 
 local function uiClick(obj)
     if not obj or not obj.Parent then return false end
-    if not vimAvailable() then
-        return false
+    if not guiVisible(obj) then return false end
+    local ok, center = pcall(screenCenter, obj)
+    if not ok then return false end
+    if center.X == 0 and center.Y == 0 then return false end
+    local camera = Workspace.CurrentCamera
+    if camera then
+        local vp = camera.ViewportSize
+        if center.X < -8 or center.Y < -8 or center.X > vp.X + 8 or center.Y > vp.Y + 8 then
+            return false
+        end
     end
-    local center = screenCenter(obj)
+    return uiClickAt(center.X, center.Y)
+end
+
+local function pressInteractKey()
+    local focusOk, focused = pcall(function()
+        return GuiService:GetFocusedTextBox()
+    end)
+    if focusOk and focused then return false end
+    if not vimAvailable() then return false end
     local ok = pcall(function()
-        VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 1)
-        task.wait(0.06)
-        VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 1)
+        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game, 1)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game, 1)
     end)
     return ok
 end
 
-local function uiKey(keyCode)
-    if not vimAvailable() then return false end
-    local ok = pcall(function()
-        VirtualInputManager:SendKeyEvent(true, keyCode, false, game, 1)
-        task.wait(0.05)
-        VirtualInputManager:SendKeyEvent(false, keyCode, false, game, 1)
+local function clickWorldPart(part)
+    local camera = Workspace.CurrentCamera
+    local root = getRoot()
+    if not camera or not root or not part or not part.Parent then return false end
+    local vp, onScreen = camera:WorldToViewportPoint(part.Position)
+    local viewport = camera.ViewportSize
+    if onScreen and vp.X >= 0 and vp.Y >= 0 and vp.X <= viewport.X and vp.Y <= viewport.Y then
+        return uiClickAt(vp.X, vp.Y)
+    end
+    pcall(function()
+        local flat = Vector3.new(part.Position.X - root.Position.X, 0,
+            part.Position.Z - root.Position.Z)
+        if flat.Magnitude > 0.5 then
+            root.CFrame = CFrame.lookAt(root.Position,
+                root.Position + Vector3.new(flat.X, 0, flat.Z))
+        end
     end)
-    return ok
+    return false
+end
+
+local function moveToTarget(rec)
+    local humanoid = getHumanoid()
+    local root = getRoot()
+    local pos = positionOf(rec.inst)
+    if not humanoid or not root or not pos then return end
+    if humanoid.Health <= 0 then return end
+
+    local dist = (root.Position - pos).Magnitude
+    if State.Features.tp and dist > Config.TeleportDistance
+        and now() - State.LastTeleport > Config.TeleportGap then
+        State.LastTeleport = now()
+        local ok = pcall(function()
+            local flat = root.Position - pos
+            flat = Vector3.new(flat.X, 0, flat.Z)
+            if flat.Magnitude > 0.5 then
+                flat = flat.Unit * 3
+            else
+                flat = Vector3.new(0, 0, -3)
+            end
+            root.CFrame = CFrame.new(pos + flat + Vector3.new(0, 4, 0))
+        end)
+        if ok then
+            dist = (root.Position - pos).Magnitude
+        end
+    end
+    humanoid:MoveTo(pos)
 end
 
 --------------------------------------------------------------------------------
--- navigation: one destination at a time, trigger on arrival
+-- navigation slot
 --------------------------------------------------------------------------------
 
 local Nav = {
-    Goal    = nil,
-    Until   = 0,
-    Prompt  = nil,
-    Bucket  = nil,
+    Record = nil,
+    Until  = 0,
 }
 
 local function clearNav()
-    Nav.Goal = nil
-    Nav.Prompt = nil
-    Nav.Bucket = nil
+    Nav.Record = nil
 end
 
-local function pickTarget(bucket)
-    local list = State.Prompts[bucket]
+local function readyWorld(rec)
+    return rec.kind ~= "gui"
+        and rec.inst.Parent ~= nil
+        and now() >= (State.Cooldowns[rec.inst] or 0)
+end
+
+local function pickWorldTarget(bucket)
+    local list = State.Targets[bucket]
     if not list or #list == 0 then return nil end
     local best, bestDist = nil, math.huge
-    for _, p in ipairs(list) do
-        if p.Parent and p.Enabled then
-            local cd = State.Cooldowns[p] or 0
-            if now() >= cd then
-                local d = distanceTo(p)
-                if d < bestDist then
-                    best, bestDist = p, d
-                end
+    for _, rec in ipairs(list) do
+        if readyWorld(rec) then
+            local d = distanceTo(rec.inst)
+            if d < bestDist then
+                best, bestDist = rec, d
             end
         end
     end
     return best
 end
 
-local function runBucket(bucket, statKey, label)
+local function fireRecord(rec)
+    if rec.kind == "prompt" then
+        return triggerPrompt(rec.inst)
+    elseif rec.kind == "click" then
+        if distanceTo(rec.inst) > rec.range then return false end
+        if clickWorldPart(rec.inst) then
+            State.LastTrigger[rec.inst] = now()
+            return true
+        end
+        return false
+    elseif rec.kind == "key" then
+        if distanceTo(rec.inst) > rec.range then return false end
+        local parent = rec.inst.Parent
+        if parent then
+            for _, d in ipairs(parent:GetDescendants()) do
+                if d:IsA("ProximityPrompt") and d.Enabled and distanceTo(d) <= 6 then
+                    if triggerPrompt(d) then
+                        State.LastTrigger[rec.inst] = now()
+                        return true, "prompt"
+                    end
+                end
+            end
+        end
+        if pressInteractKey() then
+            State.LastTrigger[rec.inst] = now()
+            return true, "key"
+        end
+        return false
+    elseif rec.kind == "pad" then
+        return true
+    end
+    return false
+end
+
+local function runTarget(bucket, statKey, label)
     if not State.Features[bucket] then
-        if Nav.Bucket == bucket then clearNav() end
+        if Nav.Record and Nav.Record.bucket == bucket then clearNav() end
         return
     end
-    if Nav.Prompt and Nav.Bucket ~= bucket then return end
 
-    if Nav.Bucket == bucket and Nav.Prompt then
-        local p = Nav.Prompt
-        if not p.Parent then
+    if Nav.Record and Nav.Record.bucket == bucket then
+        local rec = Nav.Record
+        if rec.inst.Parent == nil then
             clearNav()
             return
         end
-        local d = distanceTo(p)
-        if d <= Config.TriggerDistance then
-            if triggerPrompt(p) then
-                State.Cooldowns[p] = now() + Config.PerPromptCooldown
-                State.Cooldowns["__" .. bucket] = now() + Config.PromptCooldown
+        local d = distanceTo(rec.inst)
+        if d <= rec.range then
+            local ok, mode = fireRecord(rec)
+            if ok then
+                State.Cooldowns[rec.inst] = now() + Config.PerPromptCooldown
+                State.Cooldowns["__" .. bucket] = now() +
+                    (bucket == "raid" and 2 or Config.PromptCooldown)
                 State.Stats[statKey] = State.Stats[statKey] + 1
-                addLog(label .. " #" .. State.Stats[statKey])
+                if mode == "key" then
+                    addLog(label .. " #" .. State.Stats[statKey] .. " (E key)")
+                else
+                    addLog(label .. " #" .. State.Stats[statKey])
+                end
+            else
+                State.Cooldowns[rec.inst] = now() + 2
             end
             clearNav()
         elseif now() > Nav.Until then
-            addLog(label .. ": move timeout")
+            addLog(label .. ": move timeout — skipping target")
+            State.Cooldowns[rec.inst] = now() + 15
             clearNav()
         else
-            moveTo(positionOf(p))
+            moveToTarget(rec)
         end
+        return
+    end
+
+    local list = State.Targets[bucket]
+    if list then
+        for _, rec in ipairs(list) do
+            if rec.kind == "gui" and rec.inst.Parent and guiVisible(rec.inst)
+                and now() >= (State.Cooldowns[rec.inst] or 0) then
+                if uiClick(rec.inst) then
+                    State.Cooldowns[rec.inst] = now() + Config.GuiTargetCooldown
+                    State.Stats[statKey] = State.Stats[statKey] + 1
+                    addLog(label .. " (gui) #" .. State.Stats[statKey])
+                    return
+                else
+                    State.Cooldowns[rec.inst] = now() + Config.GuiTargetCooldown
+                end
+            end
+        end
+    end
+
+    if Nav.Record and Nav.Record.bucket ~= bucket then
         return
     end
 
     if now() < (State.Cooldowns["__" .. bucket] or 0) then return end
-    local target = pickTarget(bucket)
-    if not target then
-        return
-    end
-    Nav.Goal = positionOf(target)
-    Nav.Prompt = target
-    Nav.Bucket = bucket
+    local target = pickWorldTarget(bucket)
+    if not target then return end
+    Nav.Record = target
     Nav.Until = now() + Config.MoveTimeout
 end
 
 --------------------------------------------------------------------------------
--- auto collect pads: walk over loose cash/claim parts in the base
+-- cash pads: walk over anchored cash/claim parts in the base
 --------------------------------------------------------------------------------
 
 local function runCollectPads()
     if not State.Features.collect then return end
-    if Nav.Prompt then return end
+    if Nav.Record then return end
     if now() < (State.Cooldowns["__pads"] or 0) then return end
     local root = getRoot()
     if not root then return end
@@ -604,7 +839,9 @@ local function runCollectPads()
         if d:IsA("BasePart") and d.Anchored then
             local n = lower(d.Name)
             if matchAny(n, { "cash", "money", "claim", "collector", "dropoff", "payout" })
-                and not string.find(n, "wall", 1, true) then
+                and not string.find(n, "wall", 1, true)
+                and now() >= (State.Cooldowns[d] or 0)
+                and (State.Base == nil or State.Base:IsAncestorOf(d)) then
                 local d2 = (root.Position - d.Position).Magnitude
                 if d2 < bestDist then
                     best, bestDist = d, d2
@@ -613,8 +850,9 @@ local function runCollectPads()
         end
     end
     if best then
-        moveTo(best.Position)
-        State.Cooldowns["__pads"] = now() + 1.0
+        Nav.Record = { kind = "pad", inst = best, bucket = "collect", range = 4 }
+        Nav.Until = now() + Config.MoveTimeout
+        State.Cooldowns["__pads"] = now() + 3.0
     end
 end
 
@@ -624,9 +862,7 @@ end
 
 local function runRaid()
     if not State.Features.raid then return end
-    local raiding = raidGuiVisible()
-    if not raiding then return end
-    if Nav.Bucket == "raid" then return end
+    if not raidGuiVisible() then return end
 
     findGuiObjects()
     if State.GuiParts.bribe and now() >= (State.Cooldowns["__raidui"] or 0) then
@@ -637,13 +873,11 @@ local function runRaid()
             return
         end
     end
+    if Nav.Record then return end
     if now() < (State.Cooldowns["__raid"] or 0) then return end
-    local target = pickTarget("raid")
+    local target = pickWorldTarget("raid")
     if target then
-        clearNav()
-        Nav.Goal = positionOf(target)
-        Nav.Prompt = target
-        Nav.Bucket = "raid"
+        Nav.Record = target
         Nav.Until = now() + Config.MoveTimeout
         State.Cooldowns["__raid"] = now() + 2
         addLog("raid detected: heading to bribe")
@@ -687,9 +921,29 @@ end
 -- actions: code redemption
 --------------------------------------------------------------------------------
 
+local redeemCodesImpl
+
 local function redeemCodes()
+    if State.Busy then
+        addLog("codes: busy with another action")
+        return false
+    end
+    State.Busy = true
+    local okRun, result = pcall(redeemCodesImpl)
+    State.Busy = false
+    pcall(function()
+        local box = State.GuiParts.codeBox
+        if box then box:ReleaseFocus() end
+    end)
+    if not okRun then
+        addLog("codes error: " .. tostring(result))
+    end
+    return result
+end
+
+redeemCodesImpl = function()
     if not vimAvailable() then
-        addLog("codes: VirtualInputManager unavailable in this executor — redeem manually (Shop > Codes)")
+        addLog("codes: VirtualInputManager unavailable — redeem manually (Shop > Codes)")
         return false
     end
     addLog("codes: starting redemption of " .. #KNOWN_CODES .. " codes")
@@ -743,7 +997,13 @@ local function redeemCodes()
     end
 
     local done = 0
+    local function releaseBox()
+        if box then
+            pcall(function() box:ReleaseFocus() end)
+        end
+    end
     for _, code in ipairs(KNOWN_CODES) do
+        if not State.Running then break end
         local ok = pcall(function()
             box:CaptureFocus()
             box.Text = code
@@ -756,15 +1016,13 @@ local function redeemCodes()
                 clicked = uiClick(redeemBtn)
             end
             if not clicked then
-                clicked = clickMatching({ "redeem", "claim" }, "redeem button")
-            end
-            if not clicked then
-                uiKey(Enum.KeyCode.Return)
+                clicked = clickMatching({ "redeem" }, "redeem button")
             end
             task.wait(0.5)
             done = done + 1
         end
     end
+    releaseBox()
     addLog(("codes: attempted %d/%d (watch for cash/boost notifications)"):format(done, #KNOWN_CODES))
     return true
 end
@@ -776,23 +1034,21 @@ local function bribeNow()
         addLog("bribe: clicked on demand")
         return true
     end
-    local target = pickTarget("raid")
+    local target = pickWorldTarget("raid")
     if target then
-        if distanceTo(target) <= Config.TriggerDistance then
-            State.Cooldowns[target] = now() + Config.PerPromptCooldown
-            if triggerPrompt(target) then
+        if distanceTo(target.inst) <= target.range then
+            if fireRecord(target) then
+                State.Cooldowns[target.inst] = now() + Config.PerPromptCooldown
                 State.Stats.bribed = State.Stats.bribed + 1
                 addLog("bribe: prompt triggered")
                 return true
             end
-            addLog("bribe: prompt cooling down")
+            addLog("bribe: trigger did not fire (cooldown?)")
             return false
         else
             State.Features.raid = true
             clearNav()
-            Nav.Goal = positionOf(target)
-            Nav.Prompt = target
-            Nav.Bucket = "raid"
+            Nav.Record = target
             Nav.Until = now() + Config.MoveTimeout
             addLog("bribe: moving to prompt (auto raid bribe enabled)")
             return true
@@ -807,19 +1063,29 @@ end
 --------------------------------------------------------------------------------
 
 local function runScanReport()
-    rescan()
+    rescanTargets()
     findGuiObjects()
     local lines = {}
     lines[#lines + 1] = "=== ChinaSide Auto Hub scan report ==="
     lines[#lines + 1] = "place=" .. tostring(game.PlaceId) .. " time=" .. os.date("%H:%M:%S")
     lines[#lines + 1] = "base=" .. (State.Base and State.Base:GetFullName() or "nil")
         .. " why=" .. tostring(State.BaseWhy)
-    for bucket, list in pairs(State.Prompts) do
-        lines[#lines + 1] = ("prompts.%s=%d"):format(bucket, #list)
+    lines[#lines + 1] = ("counts: prompts=%d click=%d stations=%d gui=%d"):format(
+        State.Counts.prompt, State.Counts.click, State.Counts.key, State.Counts.gui)
+    for _, bucket in ipairs(BUCKET_ORDER) do
+        local list = State.Targets[bucket]
+        lines[#lines + 1] = ("targets.%s=%d"):format(bucket, #list)
         for i = 1, math.min(#list, 6) do
-            local p = list[i]
-            lines[#lines + 1] = "  - " .. p:GetFullName()
-                .. " [" .. tostring(p.ActionText) .. "/" .. tostring(p.ObjectText) .. "]"
+            local rec = list[i]
+            local name = "?"
+            pcall(function()
+                name = rec.inst:GetFullName()
+            end)
+            local extra = ""
+            if rec.kind == "gui" and rec.inst:IsA("TextButton") then
+                extra = " [" .. tostring(rec.inst.Text) .. "]"
+            end
+            lines[#lines + 1] = ("  - %s: %s%s"):format(rec.kind, name, extra)
         end
     end
     local g = State.GuiParts
@@ -845,8 +1111,10 @@ local function runScanReport()
     end
     local report = table.concat(lines, "\n")
     print(report)
-    for _, line in ipairs(lines) do
-        addLog(line)
+    addLog(("scan: %d lines printed to console (base=%s)"):format(
+        #lines, State.Base and State.Base:GetName() or "nil"))
+    for i = math.min(#lines, 6), 1, -1 do
+        addLog(lines[i])
     end
     setStatus("scan complete — " .. #lines .. " lines printed to console")
     return report
@@ -866,6 +1134,9 @@ local COLORS = {
     off    = Color3.fromRGB(80, 86, 100),
 }
 
+local toggles = {}
+local toggleRows = {}
+
 local function mk(className, props, parent)
     local inst = Instance.new(className)
     for k, v in pairs(props) do
@@ -877,22 +1148,17 @@ local function mk(className, props, parent)
     return inst
 end
 
-local toggles = {}
-local toggleRows = {}
-
 local function buildGui()
-    local old = LocalPlayer:FindFirstChild("PlayerGui")
-    if old then
-        local existing = old:FindFirstChild(HUB_NAME)
-        if existing then existing:Destroy() end
-    end
+    local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+    local existing = playerGui:FindFirstChild(HUB_NAME)
+    if existing then existing:Destroy() end
 
     local screen = mk("ScreenGui", {
         Name = HUB_NAME,
         ResetOnSpawn = false,
         ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
         IgnoreGuiInset = false,
-    }, LocalPlayer:WaitForChild("PlayerGui"))
+    }, playerGui)
 
     local main = mk("Frame", {
         Name = "Main",
@@ -983,6 +1249,7 @@ local function buildGui()
         { key = "hire",    label = "Auto Hire Staff" },
         { key = "crate",   label = "Auto Open Crates" },
         { key = "raid",    label = "Auto Raid Bribe" },
+        { key = "tp",      label = "Teleport to Stations" },
         { key = "speed",   label = ("Walk Speed (%d)"):format(Config.WalkSpeed) },
         { key = "antiafk", label = "Anti-AFK" },
     }
@@ -1128,18 +1395,10 @@ local function buildGui()
     return screen
 end
 
-local function setToggleVisual(key)
-    local dot = toggleRows[key]
-    if dot then
-        dot.BackgroundColor3 = State.Features[key] and COLORS.on or COLORS.off
-    end
-end
-
 local function bindGui()
     for key, btn in pairs(toggles) do
         btn.Activated:Connect(function()
             State.Features[key] = not State.Features[key]
-            setToggleVisual(key)
             addLog((State.Features[key] and "on: " or "off: ") .. key)
             if key == "speed" and not State.Features.speed and State.SpeedApplied then
                 local humanoid = getHumanoid()
@@ -1167,6 +1426,7 @@ local function bindGui()
         if State.SpeedApplied then
             local humanoid = getHumanoid()
             if humanoid then humanoid.WalkSpeed = State.SavedSpeed end
+            State.SpeedApplied = false
         end
         for _, conn in ipairs(Connections) do
             pcall(function() conn:Disconnect() end)
@@ -1194,7 +1454,7 @@ local function updateStatsText()
         dot.BackgroundColor3 = State.Features[key] and COLORS.on or COLORS.off
     end
     local s = State.Stats
-    Gui.Stats.Text = ("photos %d  orders %d  ships %d  $collected %d  hires %d  bribes %d  crates %d"):format(
+    Gui.Stats.Text = ("photos %d  orders %d  ships %d  cash %d  hired %d  bribes %d  crates %d"):format(
         s.photos, s.orders, s.ships, s.collected, s.hired, s.bribed, s.crates)
 end
 
@@ -1209,35 +1469,41 @@ local function tick()
     end
 
     if now() - State.ScanAt >= Config.ScanInterval then
-        safeCall(rescan)
+        safeCall(rescanTargets)
         safeCall(findGuiObjects)
     end
 
     applySpeed()
     runAntiAfk()
 
-    safeCall(runRaid)
+    if not State.Busy then
+        safeCall(runRaid)
 
-    local order = { "raid", "photo", "order", "ship", "collect", "hire", "crate" }
-    for _, bucket in ipairs(order) do
-        safeCall(runBucket, bucket, STAT_KEYS[bucket], bucket:upper())
+        for _, bucket in ipairs(BUCKET_ORDER) do
+            safeCall(runTarget, bucket, STAT_KEYS[bucket], bucket:upper())
+        end
+
+        safeCall(runCollectPads)
     end
 
-    safeCall(runCollectPads)
-
-    local promptTotal = 0
-    for _, list in pairs(State.Prompts) do
-        promptTotal = promptTotal + #list
+    local total = 0
+    for _, bucket in ipairs(BUCKET_ORDER) do
+        if State.Features[bucket] then
+            total = total + #State.Targets[bucket]
+        end
     end
-    if promptTotal == 0 then
-        setStatus(("no prompts yet — base: %s (%s)"):format(
-            State.Base and State.Base:GetName() or "not found", State.BaseWhy))
-    elseif Nav.Prompt then
-        setStatus(("moving to %s (%s) — %.0f studs"):format(
-            Nav.Bucket or "?", tostring(Nav.Prompt.Name), distanceTo(Nav.Prompt)))
+    local baseTag = State.Base and State.Base:GetName() or "not found"
+    if total == 0 then
+        setStatus(("base: %s | no active targets — SCAN for report"):format(baseTag))
+    elseif Nav.Record then
+        local name = "?"
+        pcall(function() name = Nav.Record.inst.Name end)
+        setStatus(("base: %s | %s: %s (%.0f studs)"):format(
+            baseTag, Nav.Record.kind, name, distanceTo(Nav.Record.inst)))
     else
-        setStatus(("base: %s | prompts: %d | ready"):format(
-            State.Base and State.Base:GetName() or "not found", promptTotal))
+        setStatus(("base: %s | P%d C%d S%d G%d | ready"):format(
+            baseTag, State.Counts.prompt, State.Counts.click,
+            State.Counts.key, State.Counts.gui))
     end
     updateStatsText()
 end
@@ -1253,24 +1519,55 @@ local function onCharacterAdded(character)
         clearNav()
         addLog("character spawned")
         task.delay(1, function()
-            safeCall(rescan)
+            safeCall(rescanTargets)
         end)
     end
 end
 
 local function start()
     if game.PlaceId ~= PLACE_ID then
-        addLog(("warning: place %s is not ChinaSide Tycoon (%s) — keyword scan may find nothing")
+        addLog(("warning: place %s is not ChinaSide Tycoon (%s)")
             :format(tostring(game.PlaceId), tostring(PLACE_ID)))
     end
+
+    local runStamp = tostring(now())
+    pcall(function()
+        LocalPlayer:SetAttribute(HUB_NAME .. "Run", runStamp)
+    end)
+    task.spawn(function()
+        while State.Running do
+            task.wait(2)
+            local ok, current = pcall(function()
+                return LocalPlayer:GetAttribute(HUB_NAME .. "Run")
+            end)
+            if ok and current ~= nil and current ~= runStamp then
+                addLog("new instance started — stopping this one")
+                State.Running = false
+                if State.SpeedApplied then
+                    local humanoid = getHumanoid()
+                    if humanoid then humanoid.WalkSpeed = State.SavedSpeed end
+                    State.SpeedApplied = false
+                end
+                for _, conn in ipairs(Connections) do
+                    pcall(function() conn:Disconnect() end)
+                end
+                table.clear(Connections)
+                if Gui and Gui.Screen then
+                    Gui.Screen:Destroy()
+                end
+                Gui = nil
+                return
+            end
+        end
+    end)
 
     buildGui()
     bindGui()
 
-    addLog("ChinaSide Auto Hub loaded")
+    addLog("ChinaSide Auto Hub v1.1 loaded")
     addLog(("place=%s player=%s"):format(tostring(game.PlaceId), LocalPlayer.Name))
 
-    safeCall(rescan)
+    safeCall(rescanTargets)
     safeCall(findGuiObjects)
 
     if LocalPlayer.Character then
