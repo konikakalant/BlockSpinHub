@@ -1,0 +1,1316 @@
+--[[================================================================================
+CHINASIDE TYCOON — AUTO HUB
+Game:   ChinaSide Tycoon by Goyboy Games (Roblox)
+Place:  88793580588296   Universe: 10764967952
+Build:  1.0 (researched 2026-09-26)
+
+RESEARCH — HOW THE GAME WORKS
+--------------------------------------------------------------------------------
+ChinaSide Tycoon is a dropshipping / shipping-agent warehouse tycoon. The core
+loop, from the official description, codes pages and creator guides:
+
+  * Orders come in for items purchased from "sellers".
+  * Items land in your warehouse — you shoot QC (quality control) PHOTOS at
+    your photo tables (this is the main hands-on interaction).
+  * You PROCESS ORDERS (pack / label) and then SHIP HAULS — each shipped haul
+    pays out cash.
+  * You HIRE staff: packers, photographers, forklift drivers, security.
+    More staff = more of the loop runs without you; security reduces raid risk.
+  * You can open a FACTORY (conveyors, produce your own stock) — a mid-game
+    money sink that raises margins.
+  * Police RAIDS happen periodically; you can fight the risk with security or
+    PAY A BRIBE when a raid hits.
+  * Star rating + followers = more customers; crates are a luck/reward mechanic.
+  * Earnings accrue OFFLINE (claim on rejoin).
+  * Codes are redeemed in: Shop -> Codes tab -> paste -> Redeem.
+
+Working codes at research time: 5klikes, followers67, FREE, 250likes, charts,
+pikobuy, tiktok, repempire
+
+DESIGN OF THIS SCRIPT
+--------------------------------------------------------------------------------
+The game has no published script and is only weeks old, so nothing is hard
+coded to internals. Everything is discovered at runtime:
+
+  * Base finder      — attributes / names / plot folders -> your tycoon
+  * Prompt discovery — every ProximityPrompt in your base, bucketed by action
+                       (photo / order / ship / collect / hire / crate / raid)
+  * Movement         — walk the character to stations, trigger prompts the
+                       same way the game does (InputHoldBegin/End)
+  * UI actions       — code redemption and raid bribe buttons are pressed with
+                       VirtualInputManager screen clicks (guarded, degrades
+                       honestly if unavailable)
+  * Scanner          — the SCAN button dumps what it found so missing pieces
+                       are visible instead of silent
+
+Features (toggle in the GUI):
+  Auto QC Photos | Auto Process Orders | Auto Ship Hauls | Auto Collect
+  Auto Hire Staff (off by default) | Auto Raid Bribe (on) | Auto Open Crates
+  (off by default) | Walk Speed | Anti-AFK
+Actions:
+  SCAN | REDEEM CODES | BRIBE NOW | UNLOAD
+
+Run in any Roblox executor. Client-side automation only: no anti-cheat
+bypass, no remote argument guessing, no server manipulation. Playing this
+way may violate the game's terms — your account, your call.
+================================================================================]]
+
+local Players            = game:GetService("Players")
+local Workspace          = game:GetService("Workspace")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local LocalPlayer        = Players.LocalPlayer
+
+local PLACE_ID  = 88793580588296
+local HUB_NAME  = "ChinaSideAutoHub"
+
+local STAT_KEYS = {
+    photo = "photos", order = "orders", ship = "ships",
+    collect = "collected", hire = "hired", crate = "crates", raid = "bribed",
+}
+
+local KNOWN_CODES = {
+    "5klikes", "followers67", "FREE", "250likes",
+    "charts", "pikobuy", "tiktok", "repempire",
+}
+
+local BUCKET_PATTERNS = {
+    photo   = { "photo", "qc", "camera", "shoot", "snapshot", "quality" },
+    order   = { "order", "process", "pack", "label", "sort", "fulfil", "fulfill" },
+    ship    = { "ship", "haul", "deliver", "dispatch", "send", "van", "truck" },
+    collect = { "collect", "cash", "money", "claim", "earn", "pickup", "pick up",
+                "revenue", "offline", "sale", "sell", "income", "payout" },
+    hire    = { "hire", "employ", "recruit", "staff", "worker" },
+    crate   = { "crate", "unbox", "open", "spin", "roll", "gacha" },
+    raid    = { "bribe", "raid", "police", "officer", "fine", "pay off", "bail" },
+}
+
+local Config = {
+    ScanInterval      = 2.0,
+    PromptCooldown    = 0.35,
+    PerPromptCooldown = 1.0,
+    MoveTimeout       = 9.0,
+    TriggerDistance   = 10,
+    TickRate          = 0.25,
+    WalkSpeed         = 32,
+}
+
+local State = {
+    Running   = true,
+    Base      = nil,
+    BaseWhy   = "scanning...",
+    Prompts   = { photo={}, order={}, ship={}, collect={}, hire={}, crate={}, raid={} },
+    ScanAt    = 0,
+    ScanCount = 0,
+    GuiParts  = { shop=nil, codesTab=nil, codeBox=nil, redeem=nil, bribe=nil },
+    Cooldowns = {},
+    LastTrigger = {},
+    SpeedApplied = false,
+    SavedSpeed = 16,
+    Features = {
+        photo   = true,
+        order   = true,
+        ship    = true,
+        collect = true,
+        hire    = false,
+        crate   = false,
+        raid    = true,
+        speed   = false,
+        antiafk = true,
+    },
+    Stats = { photos=0, orders=0, ships=0, collected=0, hired=0, bribed=0, crates=0 },
+}
+
+local LogLines = {}
+local Connections = {}
+local Gui = nil
+
+--------------------------------------------------------------------------------
+-- helpers
+--------------------------------------------------------------------------------
+
+local function now()
+    return os.clock()
+end
+
+local function lower(s)
+    return string.lower(tostring(s or ""))
+end
+
+local function addLog(line)
+    table.insert(LogLines, 1, string.format("[%s] %s", os.date("%H:%M:%S"), line))
+    while #LogLines > 40 do
+        table.remove(LogLines)
+    end
+    if Gui and Gui.Log then
+        Gui.Log.Text = table.concat(LogLines, "\n")
+    end
+end
+
+local function setStatus(text)
+    if Gui and Gui.Status then
+        Gui.Status.Text = text
+    end
+end
+
+local function safeCall(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        addLog("error: " .. tostring(err))
+    end
+    return ok
+end
+
+local function guiVisible(obj)
+    local node = obj
+    while node and node ~= game do
+        if node:IsA("GuiObject") and node.Visible == false then
+            return false
+        end
+        if node:IsA("LayerCollector") and node.Enabled == false then
+            return false
+        end
+        node = node.Parent
+    end
+    return true
+end
+
+local function matchAny(text, patterns)
+    text = lower(text)
+    for _, p in ipairs(patterns) do
+        if string.find(text, p, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+--------------------------------------------------------------------------------
+-- character
+--------------------------------------------------------------------------------
+
+local function getCharacter()
+    return LocalPlayer.Character
+end
+
+local function getHumanoid()
+    local c = getCharacter()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot()
+    local c = getCharacter()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function positionOf(inst)
+    if not inst then return nil end
+    if inst:IsA("ProximityPrompt") then
+        local node = inst.Parent
+        while node and node ~= game do
+            if node:IsA("BasePart") or node:IsA("Model") or node:IsA("Folder") then
+                return positionOf(node)
+            end
+            node = node.Parent
+        end
+        return nil
+    end
+    if inst:IsA("BasePart") then
+        return inst.Position
+    end
+    local ok, pos = pcall(function()
+        return inst:GetPivot().Position
+    end)
+    if ok then return pos end
+    if inst:IsA("Model") or inst:IsA("Folder") then
+        local p = inst:FindFirstChildWhichIsA("BasePart", true)
+        if p then return p.Position end
+    end
+    return nil
+end
+
+local function distanceTo(inst)
+    local root = getRoot()
+    local pos = positionOf(inst)
+    if not root or not pos then return math.huge end
+    return (root.Position - pos).Magnitude
+end
+
+--------------------------------------------------------------------------------
+-- prompt discovery + base discovery
+--------------------------------------------------------------------------------
+
+local function promptLabel(p)
+    return lower(table.concat({ tostring(p.Name), tostring(p.ActionText), tostring(p.ObjectText) }, " "))
+end
+
+local function bucketFor(p)
+    local text = promptLabel(p)
+    local order = { "raid", "photo", "order", "ship", "collect", "hire", "crate" }
+    for _, key in ipairs(order) do
+        if matchAny(text, BUCKET_PATTERNS[key]) then
+            return key
+        end
+    end
+    return nil
+end
+
+local function clearPrompts()
+    for _, list in pairs(State.Prompts) do
+        table.clear(list)
+    end
+end
+
+local function scanPrompts(container)
+    clearPrompts()
+    local total = 0
+    for _, d in ipairs(container:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Enabled then
+            local bucket = bucketFor(d)
+            if bucket then
+                table.insert(State.Prompts[bucket], d)
+                total = total + 1
+            end
+        end
+    end
+    for _, list in pairs(State.Prompts) do
+        table.sort(list, function(a, b)
+            return distanceTo(a) < distanceTo(b)
+        end)
+    end
+    return total
+end
+
+local function modelOwnerMatch(model)
+    local userId = tostring(LocalPlayer.UserId)
+    local name = lower(LocalPlayer.Name)
+    local display = lower(LocalPlayer.DisplayName)
+    for attr, value in pairs(model:GetAttributes()) do
+        local v = lower(value)
+        local a = lower(attr)
+        if v == userId or v == name or v == display then
+            if string.find(a, "owner") or string.find(a, "user") or string.find(a, "player") then
+                return true
+            end
+        end
+    end
+    local lname = lower(model.Name)
+    if lname == name or lname == display then
+        return true
+    end
+    if (name ~= display) and string.find(lname, display, 1, true) then
+        return true
+    end
+    return false
+end
+
+local function isCharacterModel(model)
+    return model:FindFirstChildOfClass("Humanoid") ~= nil
+end
+
+local function findBase()
+    local candidates = {}
+
+    local folders = { "Tycoons", "Tycoon", "Bases", "Base", "Plots", "Plot", "Players" }
+    for _, folderName in ipairs(folders) do
+        local folder = Workspace:FindFirstChild(folderName)
+        if folder and (folder:IsA("Folder") or folder:IsA("Model")) then
+            for _, child in ipairs(folder:GetChildren()) do
+                if (child:IsA("Model") or child:IsA("Folder")) and not isCharacterModel(child) then
+                    if modelOwnerMatch(child) then
+                        return child, "owner match in " .. folderName
+                    end
+                    table.insert(candidates, child)
+                end
+            end
+        end
+    end
+
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if (d:IsA("Model") or d:IsA("Folder")) and not isCharacterModel(d)
+            and modelOwnerMatch(d) then
+            return d, "owner attribute/name match"
+        end
+    end
+    if #candidates == 1 then
+        return candidates[1], "single plot (no owner match)"
+    end
+    return nil, "no owner match found"
+end
+
+local function rescan()
+    State.ScanCount = State.ScanCount + 1
+    local base, why = findBase()
+    local container = base or Workspace
+    local changed = (base ~= State.Base)
+    State.Base = base
+    State.BaseWhy = why or "unknown"
+    local count = scanPrompts(container)
+    if not base then
+        count = scanPrompts(Workspace)
+    end
+    State.ScanAt = now()
+    if changed then
+        addLog(base and ("base: " .. base:GetName() .. " (" .. why .. ")")
+                  or ("base not found (" .. tostring(why) .. "); scanning workspace"))
+    end
+    if State.ScanCount == 1 then
+        addLog(("scan #%d: %d prompts in %s"):format(
+            State.ScanCount, count, base and base:GetName() or "Workspace"))
+    end
+    for key, at in pairs(State.LastTrigger) do
+        if typeof(key) == "Instance" and (now() - at > 60 or key.Parent == nil) then
+            State.LastTrigger[key] = nil
+        end
+    end
+    for key, at in pairs(State.Cooldowns) do
+        if typeof(key) == "Instance" and (key.Parent == nil or now() > at) then
+            State.Cooldowns[key] = nil
+        end
+    end
+    return count
+end
+
+--------------------------------------------------------------------------------
+-- discovery: screen UI (shop / codes / bribe)
+--------------------------------------------------------------------------------
+
+local function findGuiObjects()
+    local g = State.GuiParts
+    g.shop, g.codesTab, g.codeBox, g.redeem, g.bribe = nil, nil, nil, nil, nil
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+
+    for _, gui in ipairs(playerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Name ~= HUB_NAME and gui.Enabled then
+            for _, d in ipairs(gui:GetDescendants()) do
+                if d:IsA("TextButton") or d:IsA("ImageButton") then
+                    local t = d:IsA("TextButton") and (lower(d.Text) .. " " .. lower(d.Name))
+                        or lower(d.Name)
+                    if not g.shop and matchAny(t, { "shop", "store" }) and guiVisible(d) then
+                        g.shop = d
+                    end
+                    if not g.codesTab and matchAny(t, { "code", "redeem" }) and guiVisible(d) then
+                        g.codesTab = d
+                    end
+                    if not g.redeem and matchAny(t, { "redeem", "claim", "submit" })
+                        and guiVisible(d) and not matchAny(t, { "code tab" }) then
+                        g.redeem = d
+                    end
+                    if not g.bribe and matchAny(t, { "bribe", "pay off", "payoff", "bail" })
+                        and guiVisible(d) then
+                        g.bribe = d
+                    end
+                elseif d:IsA("TextBox") then
+                    if not g.codeBox and matchAny(lower(d.Name) .. " " .. lower(d.PlaceholderText),
+                        { "code", "redeem" }) then
+                        g.codeBox = d
+                    end
+                end
+            end
+        end
+    end
+end
+
+local function inHubGui(inst)
+    local node = inst
+    while node and node ~= game do
+        if node.Name == HUB_NAME then return true end
+        node = node.Parent
+    end
+    return false
+end
+
+local function raidGuiVisible()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return false end
+    for _, gui in ipairs(playerGui:GetDescendants()) do
+        if (gui:IsA("TextLabel") or gui:IsA("TextButton")) and gui.Visible
+            and not inHubGui(gui) then
+            local t = lower(gui.Text)
+            if (string.find(t, "raid", 1, true) or string.find(t, "police", 1, true)
+                or string.find(t, "busted", 1, true)) and guiVisible(gui) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+--------------------------------------------------------------------------------
+-- interaction: prompts, movement, UI clicks
+--------------------------------------------------------------------------------
+
+local function triggerPrompt(p)
+    if not p or not p.Parent then return false end
+    local key = p
+    local last = State.LastTrigger[key] or 0
+    if now() - last < Config.PerPromptCooldown then return false end
+    State.LastTrigger[key] = now()
+
+    local originalHold = p.HoldDuration
+    local ok = pcall(function()
+        p.HoldDuration = 0
+        p:InputHoldBegin()
+        task.wait(0.05)
+        p:InputHoldEnd()
+    end)
+    pcall(function()
+        p.HoldDuration = originalHold
+    end)
+    if ok then
+        return true
+    end
+    addLog("prompt trigger failed: " .. tostring(p.Name))
+    return false
+end
+
+local function moveTo(targetPos)
+    local humanoid = getHumanoid()
+    local root = getRoot()
+    if not humanoid or not root or not targetPos then return false end
+    if humanoid.Health <= 0 then return false end
+    humanoid:MoveTo(targetPos)
+    return true
+end
+
+local function vimAvailable()
+    return typeof(VirtualInputManager) == "Instance"
+end
+
+local function screenCenter(obj)
+    local pos = obj.AbsolutePosition
+    local size = obj.AbsoluteSize
+    return Vector2.new(pos.X + size.X / 2, pos.Y + size.Y / 2)
+end
+
+local function uiClick(obj)
+    if not obj or not obj.Parent then return false end
+    if not vimAvailable() then
+        return false
+    end
+    local center = screenCenter(obj)
+    local ok = pcall(function()
+        VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, true, game, 1)
+        task.wait(0.06)
+        VirtualInputManager:SendMouseButtonEvent(center.X, center.Y, 0, false, game, 1)
+    end)
+    return ok
+end
+
+local function uiKey(keyCode)
+    if not vimAvailable() then return false end
+    local ok = pcall(function()
+        VirtualInputManager:SendKeyEvent(true, keyCode, false, game, 1)
+        task.wait(0.05)
+        VirtualInputManager:SendKeyEvent(false, keyCode, false, game, 1)
+    end)
+    return ok
+end
+
+--------------------------------------------------------------------------------
+-- navigation: one destination at a time, trigger on arrival
+--------------------------------------------------------------------------------
+
+local Nav = {
+    Goal    = nil,
+    Until   = 0,
+    Prompt  = nil,
+    Bucket  = nil,
+}
+
+local function clearNav()
+    Nav.Goal = nil
+    Nav.Prompt = nil
+    Nav.Bucket = nil
+end
+
+local function pickTarget(bucket)
+    local list = State.Prompts[bucket]
+    if not list or #list == 0 then return nil end
+    local best, bestDist = nil, math.huge
+    for _, p in ipairs(list) do
+        if p.Parent and p.Enabled then
+            local cd = State.Cooldowns[p] or 0
+            if now() >= cd then
+                local d = distanceTo(p)
+                if d < bestDist then
+                    best, bestDist = p, d
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function runBucket(bucket, statKey, label)
+    if not State.Features[bucket] then
+        if Nav.Bucket == bucket then clearNav() end
+        return
+    end
+    if Nav.Prompt and Nav.Bucket ~= bucket then return end
+
+    if Nav.Bucket == bucket and Nav.Prompt then
+        local p = Nav.Prompt
+        if not p.Parent then
+            clearNav()
+            return
+        end
+        local d = distanceTo(p)
+        if d <= Config.TriggerDistance then
+            if triggerPrompt(p) then
+                State.Cooldowns[p] = now() + Config.PerPromptCooldown
+                State.Cooldowns["__" .. bucket] = now() + Config.PromptCooldown
+                State.Stats[statKey] = State.Stats[statKey] + 1
+                addLog(label .. " #" .. State.Stats[statKey])
+            end
+            clearNav()
+        elseif now() > Nav.Until then
+            addLog(label .. ": move timeout")
+            clearNav()
+        else
+            moveTo(positionOf(p))
+        end
+        return
+    end
+
+    if now() < (State.Cooldowns["__" .. bucket] or 0) then return end
+    local target = pickTarget(bucket)
+    if not target then
+        return
+    end
+    Nav.Goal = positionOf(target)
+    Nav.Prompt = target
+    Nav.Bucket = bucket
+    Nav.Until = now() + Config.MoveTimeout
+end
+
+--------------------------------------------------------------------------------
+-- auto collect pads: walk over loose cash/claim parts in the base
+--------------------------------------------------------------------------------
+
+local function runCollectPads()
+    if not State.Features.collect then return end
+    if Nav.Prompt then return end
+    if now() < (State.Cooldowns["__pads"] or 0) then return end
+    local root = getRoot()
+    if not root then return end
+
+    local container = State.Base or Workspace
+    local best, bestDist = nil, 70
+    for _, d in ipairs(container:GetDescendants()) do
+        if d:IsA("BasePart") and d.Anchored then
+            local n = lower(d.Name)
+            if matchAny(n, { "cash", "money", "claim", "collector", "dropoff", "payout" })
+                and not string.find(n, "wall", 1, true) then
+                local d2 = (root.Position - d.Position).Magnitude
+                if d2 < bestDist then
+                    best, bestDist = d, d2
+                end
+            end
+        end
+    end
+    if best then
+        moveTo(best.Position)
+        State.Cooldowns["__pads"] = now() + 1.0
+    end
+end
+
+--------------------------------------------------------------------------------
+-- raid defense
+--------------------------------------------------------------------------------
+
+local function runRaid()
+    if not State.Features.raid then return end
+    local raiding = raidGuiVisible()
+    if not raiding then return end
+    if Nav.Bucket == "raid" then return end
+
+    findGuiObjects()
+    if State.GuiParts.bribe and now() >= (State.Cooldowns["__raidui"] or 0) then
+        if uiClick(State.GuiParts.bribe) then
+            State.Stats.bribed = State.Stats.bribed + 1
+            addLog("raid: clicked bribe button")
+            State.Cooldowns["__raidui"] = now() + 3
+            return
+        end
+    end
+    if now() < (State.Cooldowns["__raid"] or 0) then return end
+    local target = pickTarget("raid")
+    if target then
+        clearNav()
+        Nav.Goal = positionOf(target)
+        Nav.Prompt = target
+        Nav.Bucket = "raid"
+        Nav.Until = now() + Config.MoveTimeout
+        State.Cooldowns["__raid"] = now() + 2
+        addLog("raid detected: heading to bribe")
+    end
+end
+
+--------------------------------------------------------------------------------
+-- walk speed + anti-afk
+--------------------------------------------------------------------------------
+
+local function applySpeed()
+    local humanoid = getHumanoid()
+    if not humanoid then return end
+    if State.Features.speed then
+        if not State.SpeedApplied then
+            State.SavedSpeed = humanoid.WalkSpeed
+            State.SpeedApplied = true
+        end
+        if humanoid.WalkSpeed ~= Config.WalkSpeed then
+            humanoid.WalkSpeed = Config.WalkSpeed
+        end
+    elseif State.SpeedApplied then
+        humanoid.WalkSpeed = State.SavedSpeed
+        State.SpeedApplied = false
+    end
+end
+
+local lastAfk = 0
+local function runAntiAfk()
+    if not State.Features.antiafk then return end
+    if now() - lastAfk < 120 then return end
+    lastAfk = now()
+    pcall(function()
+        local vu = game:GetService("VirtualUser")
+        vu:CaptureController()
+        vu:ClickButton2(Vector2.new(0, 0))
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- actions: code redemption
+--------------------------------------------------------------------------------
+
+local function redeemCodes()
+    if not vimAvailable() then
+        addLog("codes: VirtualInputManager unavailable in this executor — redeem manually (Shop > Codes)")
+        return false
+    end
+    addLog("codes: starting redemption of " .. #KNOWN_CODES .. " codes")
+    findGuiObjects()
+    local g = State.GuiParts
+
+    local function clickMatching(patterns, what)
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        if not playerGui then return false end
+        for _, gui in ipairs(playerGui:GetChildren()) do
+            if gui:IsA("ScreenGui") and gui.Name ~= HUB_NAME and gui.Enabled then
+                for _, d in ipairs(gui:GetDescendants()) do
+                    if (d:IsA("TextButton") or d:IsA("ImageButton")) and guiVisible(d) then
+                        local text = d:IsA("TextButton")
+                            and (lower(d.Text) .. " " .. lower(d.Name))
+                            or lower(d.Name)
+                        if matchAny(text, patterns) and uiClick(d) then
+                            task.wait(0.4)
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+        addLog("codes: " .. what .. " not found")
+        return false
+    end
+
+    if not (g.shop and g.shop.Parent and guiVisible(g.shop)) then
+        if not clickMatching({ "shop", "store" }, "shop button") then return false end
+        findGuiObjects()
+    elseif uiClick(g.shop) then
+        task.wait(0.4)
+    end
+
+    clickMatching({ "code" }, "codes tab")
+    task.wait(0.2)
+
+    local box = State.GuiParts.codeBox
+    if not box or not guiVisible(box) then
+        findGuiObjects()
+        box = State.GuiParts.codeBox
+    end
+    if not box then
+        addLog("codes: code textbox not found")
+        return false
+    end
+    if not guiVisible(box) then
+        addLog("codes: textbox exists but codes panel is not visible")
+        return false
+    end
+
+    local done = 0
+    for _, code in ipairs(KNOWN_CODES) do
+        local ok = pcall(function()
+            box:CaptureFocus()
+            box.Text = code
+            task.wait(0.08)
+        end)
+        if ok then
+            local redeemBtn = State.GuiParts.redeem
+            local clicked = false
+            if redeemBtn then
+                clicked = uiClick(redeemBtn)
+            end
+            if not clicked then
+                clicked = clickMatching({ "redeem", "claim" }, "redeem button")
+            end
+            if not clicked then
+                uiKey(Enum.KeyCode.Return)
+            end
+            task.wait(0.5)
+            done = done + 1
+        end
+    end
+    addLog(("codes: attempted %d/%d (watch for cash/boost notifications)"):format(done, #KNOWN_CODES))
+    return true
+end
+
+local function bribeNow()
+    findGuiObjects()
+    if State.GuiParts.bribe and uiClick(State.GuiParts.bribe) then
+        State.Stats.bribed = State.Stats.bribed + 1
+        addLog("bribe: clicked on demand")
+        return true
+    end
+    local target = pickTarget("raid")
+    if target then
+        if distanceTo(target) <= Config.TriggerDistance then
+            State.Cooldowns[target] = now() + Config.PerPromptCooldown
+            if triggerPrompt(target) then
+                State.Stats.bribed = State.Stats.bribed + 1
+                addLog("bribe: prompt triggered")
+                return true
+            end
+            addLog("bribe: prompt cooling down")
+            return false
+        else
+            State.Features.raid = true
+            clearNav()
+            Nav.Goal = positionOf(target)
+            Nav.Prompt = target
+            Nav.Bucket = "raid"
+            Nav.Until = now() + Config.MoveTimeout
+            addLog("bribe: moving to prompt (auto raid bribe enabled)")
+            return true
+        end
+    end
+    addLog("bribe: nothing found (are you raiding?)")
+    return false
+end
+
+--------------------------------------------------------------------------------
+-- actions: scanner report
+--------------------------------------------------------------------------------
+
+local function runScanReport()
+    rescan()
+    findGuiObjects()
+    local lines = {}
+    lines[#lines + 1] = "=== ChinaSide Auto Hub scan report ==="
+    lines[#lines + 1] = "place=" .. tostring(game.PlaceId) .. " time=" .. os.date("%H:%M:%S")
+    lines[#lines + 1] = "base=" .. (State.Base and State.Base:GetFullName() or "nil")
+        .. " why=" .. tostring(State.BaseWhy)
+    for bucket, list in pairs(State.Prompts) do
+        lines[#lines + 1] = ("prompts.%s=%d"):format(bucket, #list)
+        for i = 1, math.min(#list, 6) do
+            local p = list[i]
+            lines[#lines + 1] = "  - " .. p:GetFullName()
+                .. " [" .. tostring(p.ActionText) .. "/" .. tostring(p.ObjectText) .. "]"
+        end
+    end
+    local g = State.GuiParts
+    lines[#lines + 1] = ("ui: shop=%s codesTab=%s codeBox=%s redeem=%s bribe=%s"):format(
+        tostring(g.shop and g.shop:GetFullName()),
+        tostring(g.codesTab and g.codesTab:GetFullName()),
+        tostring(g.codeBox and g.codeBox:GetFullName()),
+        tostring(g.redeem and g.redeem:GetFullName()),
+        tostring(g.bribe and g.bribe:GetFullName()))
+    local remotes = {}
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+            local n = lower(d.Name)
+            if matchAny(n, { "order", "ship", "photo", "qc", "crate", "hire", "raid",
+                             "bribe", "code", "cash", "collect", "claim", "tycoon" }) then
+                remotes[#remotes + 1] = d.ClassName .. ":" .. d:GetFullName()
+            end
+        end
+    end
+    lines[#lines + 1] = "keyword remotes (report only, never fired): " .. #remotes
+    for i = 1, math.min(#remotes, 12) do
+        lines[#lines + 1] = "  - " .. remotes[i]
+    end
+    local report = table.concat(lines, "\n")
+    print(report)
+    for _, line in ipairs(lines) do
+        addLog(line)
+    end
+    setStatus("scan complete — " .. #lines .. " lines printed to console")
+    return report
+end
+
+--------------------------------------------------------------------------------
+-- GUI
+--------------------------------------------------------------------------------
+
+local COLORS = {
+    bg     = Color3.fromRGB(18, 20, 26),
+    panel  = Color3.fromRGB(26, 29, 37),
+    accent = Color3.fromRGB(232, 72, 60),
+    text   = Color3.fromRGB(235, 238, 245),
+    dim    = Color3.fromRGB(140, 146, 160),
+    on     = Color3.fromRGB(72, 200, 130),
+    off    = Color3.fromRGB(80, 86, 100),
+}
+
+local function mk(className, props, parent)
+    local inst = Instance.new(className)
+    for k, v in pairs(props) do
+        inst[k] = v
+    end
+    if parent then
+        inst.Parent = parent
+    end
+    return inst
+end
+
+local toggles = {}
+local toggleRows = {}
+
+local function buildGui()
+    local old = LocalPlayer:FindFirstChild("PlayerGui")
+    if old then
+        local existing = old:FindFirstChild(HUB_NAME)
+        if existing then existing:Destroy() end
+    end
+
+    local screen = mk("ScreenGui", {
+        Name = HUB_NAME,
+        ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        IgnoreGuiInset = false,
+    }, LocalPlayer:WaitForChild("PlayerGui"))
+
+    local main = mk("Frame", {
+        Name = "Main",
+        Size = UDim2.fromOffset(320, 560),
+        Position = UDim2.new(0, 24, 0.5, -280),
+        BackgroundColor3 = COLORS.bg,
+        BorderSizePixel = 0,
+        Active = true,
+        Draggable = false,
+    }, screen)
+    mk("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
+    mk("UIStroke", { Color = Color3.fromRGB(50, 55, 68), Thickness = 1 }, main)
+
+    local header = mk("Frame", {
+        Size = UDim2.new(1, 0, 0, 44),
+        BackgroundColor3 = COLORS.panel,
+        BorderSizePixel = 0,
+    }, main)
+    mk("UICorner", { CornerRadius = UDim.new(0, 10) }, header)
+    mk("Frame", {
+        Size = UDim2.new(1, 0, 0, 12),
+        Position = UDim2.new(0, 0, 1, -12),
+        BackgroundColor3 = COLORS.panel,
+        BorderSizePixel = 0,
+    }, header)
+
+    mk("TextLabel", {
+        Size = UDim2.new(1, -60, 1, 0),
+        Position = UDim2.new(0, 14, 0, 0),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "CHINASIDE AUTO HUB",
+        TextSize = 15,
+        TextColor3 = COLORS.accent,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, header)
+
+    local closeBtn = mk("TextButton", {
+        Size = UDim2.fromOffset(30, 30),
+        Position = UDim2.new(1, -36, 0, 7),
+        BackgroundColor3 = COLORS.off,
+        Font = Enum.Font.GothamBold,
+        Text = "X",
+        TextSize = 13,
+        TextColor3 = COLORS.text,
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+    }, header)
+    mk("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
+
+    local statusLabel = mk("TextLabel", {
+        Name = "Status",
+        Size = UDim2.new(1, -24, 0, 34),
+        Position = UDim2.new(0, 12, 0, 52),
+        BackgroundColor3 = COLORS.panel,
+        Font = Enum.Font.Gotham,
+        Text = "starting...",
+        TextSize = 12,
+        TextColor3 = COLORS.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true,
+        BorderSizePixel = 0,
+    }, main)
+    mk("UICorner", { CornerRadius = UDim.new(0, 6) }, statusLabel)
+
+    local listFrame = mk("ScrollingFrame", {
+        Name = "List",
+        Size = UDim2.new(1, -24, 0, 268),
+        Position = UDim2.new(0, 12, 0, 94),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 4,
+        ScrollBarImageColor3 = COLORS.accent,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+    }, main)
+    mk("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, listFrame)
+
+    local featureLabels = {
+        { key = "photo",   label = "Auto QC Photos" },
+        { key = "order",   label = "Auto Process Orders" },
+        { key = "ship",    label = "Auto Ship Hauls" },
+        { key = "collect", label = "Auto Collect Cash" },
+        { key = "hire",    label = "Auto Hire Staff" },
+        { key = "crate",   label = "Auto Open Crates" },
+        { key = "raid",    label = "Auto Raid Bribe" },
+        { key = "speed",   label = ("Walk Speed (%d)"):format(Config.WalkSpeed) },
+        { key = "antiafk", label = "Anti-AFK" },
+    }
+
+    for i, feat in ipairs(featureLabels) do
+        local row = mk("Frame", {
+            Size = UDim2.new(1, 0, 0, 26),
+            BackgroundColor3 = COLORS.panel,
+            BorderSizePixel = 0,
+            LayoutOrder = i,
+        }, listFrame)
+        mk("UICorner", { CornerRadius = UDim.new(0, 6) }, row)
+
+        mk("TextLabel", {
+            Size = UDim2.new(1, -60, 1, 0),
+            Position = UDim2.new(0, 10, 0, 0),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham,
+            Text = feat.label,
+            TextSize = 13,
+            TextColor3 = COLORS.text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+
+        local dot = mk("Frame", {
+            Size = UDim2.fromOffset(12, 12),
+            Position = UDim2.new(1, -52, 0.5, -6),
+            BackgroundColor3 = State.Features[feat.key] and COLORS.on or COLORS.off,
+            BorderSizePixel = 0,
+        }, row)
+        mk("UICorner", { CornerRadius = UDim.new(1, 0) }, dot)
+
+        local btn = mk("TextButton", {
+            Size = UDim2.new(1, 0, 1, 0),
+            BackgroundTransparency = 1,
+            Text = "",
+            AutoButtonColor = false,
+        }, row)
+        toggleRows[feat.key] = dot
+        toggles[feat.key] = btn
+    end
+
+    local actionRow = mk("Frame", {
+        Size = UDim2.new(1, -24, 0, 30),
+        Position = UDim2.new(0, 12, 0, 370),
+        BackgroundTransparency = 1,
+    }, main)
+    mk("UIListLayout", {
+        Padding = UDim.new(0, 6),
+        FillDirection = Enum.FillDirection.Horizontal,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, actionRow)
+
+    local actions = {}
+    local function actionButton(text, layoutOrder, color)
+        local b = mk("TextButton", {
+            Size = UDim2.new(0, 66, 1, 0),
+            BackgroundColor3 = color or COLORS.off,
+            Font = Enum.Font.GothamBold,
+            Text = text,
+            TextSize = 10,
+            TextColor3 = COLORS.text,
+            BorderSizePixel = 0,
+            LayoutOrder = layoutOrder,
+            AutoButtonColor = true,
+        }, actionRow)
+        mk("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+        actions[text] = b
+        return b
+    end
+    actionButton("SCAN", 1, Color3.fromRGB(50, 90, 160))
+    actionButton("CODES", 2, Color3.fromRGB(50, 120, 90))
+    actionButton("BRIBE", 3, COLORS.accent)
+    actionButton("UNLOAD", 4, Color3.fromRGB(120, 60, 60))
+
+    local statsLabel = mk("TextLabel", {
+        Name = "Stats",
+        Size = UDim2.new(1, -24, 0, 18),
+        Position = UDim2.new(0, 12, 0, 406),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Code,
+        Text = "",
+        TextSize = 11,
+        TextColor3 = COLORS.dim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, main)
+
+    local logLabel = mk("TextLabel", {
+        Name = "Log",
+        Size = UDim2.new(1, -24, 0, 128),
+        Position = UDim2.new(0, 12, 0, 428),
+        BackgroundColor3 = COLORS.panel,
+        Font = Enum.Font.Code,
+        Text = "",
+        TextSize = 10,
+        TextColor3 = COLORS.dim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+        BorderSizePixel = 0,
+    }, main)
+    mk("UICorner", { CornerRadius = UDim.new(0, 6) }, logLabel)
+
+    Gui = {
+        Screen = screen,
+        Main = main,
+        Status = statusLabel,
+        Log = logLabel,
+        Stats = statsLabel,
+        Actions = actions,
+        Close = closeBtn,
+    }
+
+    local drag, dragStart, startPos
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            drag = true
+            dragStart = input.Position
+            startPos = main.Position
+        end
+    end)
+    table.insert(Connections, UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            drag = false
+        end
+    end))
+    table.insert(Connections, UserInputService.InputChanged:Connect(function(input)
+        if not Gui or not Gui.Main then
+            drag = false
+            return
+        end
+        if drag and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end))
+
+    return screen
+end
+
+local function setToggleVisual(key)
+    local dot = toggleRows[key]
+    if dot then
+        dot.BackgroundColor3 = State.Features[key] and COLORS.on or COLORS.off
+    end
+end
+
+local function bindGui()
+    for key, btn in pairs(toggles) do
+        btn.Activated:Connect(function()
+            State.Features[key] = not State.Features[key]
+            setToggleVisual(key)
+            addLog((State.Features[key] and "on: " or "off: ") .. key)
+            if key == "speed" and not State.Features.speed and State.SpeedApplied then
+                local humanoid = getHumanoid()
+                if humanoid then humanoid.WalkSpeed = State.SavedSpeed end
+                State.SpeedApplied = false
+            end
+        end)
+    end
+    Gui.Actions.SCAN.Activated:Connect(function()
+        safeCall(runScanReport)
+    end)
+    Gui.Actions.CODES.Activated:Connect(function()
+        task.spawn(function()
+            safeCall(redeemCodes)
+        end)
+    end)
+    Gui.Actions.BRIBE.Activated:Connect(function()
+        task.spawn(function()
+            safeCall(bribeNow)
+        end)
+    end)
+    Gui.Actions.UNLOAD.Activated:Connect(function()
+        addLog("unloading...")
+        State.Running = false
+        if State.SpeedApplied then
+            local humanoid = getHumanoid()
+            if humanoid then humanoid.WalkSpeed = State.SavedSpeed end
+        end
+        for _, conn in ipairs(Connections) do
+            pcall(function() conn:Disconnect() end)
+        end
+        table.clear(Connections)
+        if Gui and Gui.Screen then
+            Gui.Screen:Destroy()
+        end
+        Gui = nil
+    end)
+    Gui.Close.Activated:Connect(function()
+        if Gui and Gui.Screen then
+            Gui.Screen.Enabled = not Gui.Screen.Enabled
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- scheduler
+--------------------------------------------------------------------------------
+
+local function updateStatsText()
+    if not Gui or not Gui.Stats then return end
+    for key, dot in pairs(toggleRows) do
+        dot.BackgroundColor3 = State.Features[key] and COLORS.on or COLORS.off
+    end
+    local s = State.Stats
+    Gui.Stats.Text = ("photos %d  orders %d  ships %d  $collected %d  hires %d  bribes %d  crates %d"):format(
+        s.photos, s.orders, s.ships, s.collected, s.hired, s.bribed, s.crates)
+end
+
+local function tick()
+    if not State.Running then return end
+
+    local character = getCharacter()
+    local humanoid = getHumanoid()
+    if not character or not humanoid or humanoid.Health <= 0 then
+        setStatus("waiting for character...")
+        return
+    end
+
+    if now() - State.ScanAt >= Config.ScanInterval then
+        safeCall(rescan)
+        safeCall(findGuiObjects)
+    end
+
+    applySpeed()
+    runAntiAfk()
+
+    safeCall(runRaid)
+
+    local order = { "raid", "photo", "order", "ship", "collect", "hire", "crate" }
+    for _, bucket in ipairs(order) do
+        safeCall(runBucket, bucket, STAT_KEYS[bucket], bucket:upper())
+    end
+
+    safeCall(runCollectPads)
+
+    local promptTotal = 0
+    for _, list in pairs(State.Prompts) do
+        promptTotal = promptTotal + #list
+    end
+    if promptTotal == 0 then
+        setStatus(("no prompts yet — base: %s (%s)"):format(
+            State.Base and State.Base:GetName() or "not found", State.BaseWhy))
+    elseif Nav.Prompt then
+        setStatus(("moving to %s (%s) — %.0f studs"):format(
+            Nav.Bucket or "?", tostring(Nav.Prompt.Name), distanceTo(Nav.Prompt)))
+    else
+        setStatus(("base: %s | prompts: %d | ready"):format(
+            State.Base and State.Base:GetName() or "not found", promptTotal))
+    end
+    updateStatsText()
+end
+
+--------------------------------------------------------------------------------
+-- lifecycle
+--------------------------------------------------------------------------------
+
+local function onCharacterAdded(character)
+    local humanoid = character:WaitForChild("Humanoid", 10)
+    if humanoid then
+        State.SpeedApplied = false
+        clearNav()
+        addLog("character spawned")
+        task.delay(1, function()
+            safeCall(rescan)
+        end)
+    end
+end
+
+local function start()
+    if game.PlaceId ~= PLACE_ID then
+        addLog(("warning: place %s is not ChinaSide Tycoon (%s) — keyword scan may find nothing")
+            :format(tostring(game.PlaceId), tostring(PLACE_ID)))
+    end
+
+    buildGui()
+    bindGui()
+
+    addLog("ChinaSide Auto Hub loaded")
+    addLog(("place=%s player=%s"):format(tostring(game.PlaceId), LocalPlayer.Name))
+
+    safeCall(rescan)
+    safeCall(findGuiObjects)
+
+    if LocalPlayer.Character then
+        onCharacterAdded(LocalPlayer.Character)
+    end
+    table.insert(Connections, LocalPlayer.CharacterAdded:Connect(onCharacterAdded))
+
+    table.insert(Connections, LocalPlayer.Idled:Connect(function()
+        if State.Features.antiafk and State.Running then
+            pcall(function()
+                local vu = game:GetService("VirtualUser")
+                vu:CaptureController()
+                vu:ClickButton2(Vector2.new(0, 0))
+            end)
+            addLog("anti-afk: idle event handled")
+        end
+    end))
+
+    local accumulator = 0
+    table.insert(Connections, RunService.Heartbeat:Connect(function(dt)
+        accumulator = accumulator + dt
+        if accumulator >= Config.TickRate then
+            accumulator = 0
+            local ok, err = pcall(tick)
+            if not ok then
+                addLog("tick error: " .. tostring(err))
+            end
+        end
+    end))
+
+    table.insert(Connections, UserInputService.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            if Gui and Gui.Screen then
+                Gui.Screen.Enabled = not Gui.Screen.Enabled
+            end
+        end
+    end))
+
+    setStatus("loaded — press RIGHT SHIFT to show/hide")
+end
+
+safeCall(start)
