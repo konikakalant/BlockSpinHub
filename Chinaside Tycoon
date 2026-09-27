@@ -1,8 +1,8 @@
 --[[================================================================================
-CHINASIDE TYCOON — AUTO HUB  (v1.1)
+CHINASIDE TYCOON — AUTO HUB  (v1.3)
 Game:   ChinaSide Tycoon by Goyboy Games (Roblox)
 Place:  88793580588296   Universe: 10764967952
-Build:  1.1 — universal interaction core
+Build:  1.3 — gamepass-free order flow
 
 RESEARCH — HOW THE GAME WORKS
 --------------------------------------------------------------------------------
@@ -47,6 +47,45 @@ owner attributes/names, targets are picked within 160 studs of you instead of
 doing nothing. The status line shows live counts of every target kind, so
 "nothing works" is always diagnosable at a glance (or use the SCAN button).
 
+WHAT CHANGED IN v1.2 (features + usability)
+--------------------------------------------------------------------------------
+* Auto Free Rewards bucket — daily / free / bonus / gift / wheel / login
+  buttons anywhere in the game UI get clicked like the other workflow buttons
+* Auto Codes on Join toggle — redeems the known codes a few seconds after
+  each spawn (manual CODES button and F8 still work)
+* PAUSE — header button or F6 freezes all automation without unloading;
+  state survives reloads
+* MINIMIZE — "_" shrinks the hub to just the header; "+" brings it back
+* Toast banners — raid detection, code runs, pause/resume, load notice
+* Settings persistence — every toggle is written to a settings file and
+  restored on the next run
+* Session timer + rewards counter in the stats line
+* GUI buttons are ranked by screen size — big primary action buttons are
+  clicked before small icon buttons
+* Codes also press Enter when no Redeem button can be found
+* Key hints: RIGHT SHIFT show/hide · F6 pause · F8 redeem codes
+
+WHAT CHANGED IN v1.3 (works without the gamepass)
+--------------------------------------------------------------------------------
+Order processing must never require the paid gamepass, so the flow now:
+
+* Auto-cancels Roblox/game purchase prompts — if a click ever opens a buy
+  dialog (gamepass, dev product, robux), the hub clicks Cancel / presses
+  Escape, logs it, and NEVER buys anything
+* Gated buttons are recognised and shelved — rows whose text/labels mention
+  robux / buy now / gamepass are skipped in discovery, and if one still
+  triggers a prompt that button is blacklisted for 90 seconds so the hub
+  falls back to the FREE interaction paths (prompts, click detectors, E at
+  the station, walking the order list)
+* Confirm dialogs are clicked — after any successful action a small window
+  opens where visible Confirm / Yes / Continue / OK buttons are clicked and
+  counted toward the same mode, so multi-step flows (process -> confirm)
+  finish instead of stalling
+* Empty-text buttons now inherit their child label text — order rows built
+  as TextButton+TextLabel are matched correctly
+* Order lists inside ScrollingFrames are scrolled into view before clicking
+* More order keywords: packing / prep / pick pack
+
 Design rules: client-side only — no anti-cheat bypass, no remote argument
 guessing, no server manipulation. Keyword remotes are reported by SCAN but
 never fired. Playing this way may violate the game's terms — your account.
@@ -67,6 +106,7 @@ local HUB_NAME  = "ChinaSideAutoHub"
 local STAT_KEYS = {
     photo = "photos", order = "orders", ship = "ships",
     collect = "collected", hire = "hired", crate = "crates", raid = "bribed",
+    reward = "rewards",
 }
 
 local KNOWN_CODES = {
@@ -77,21 +117,34 @@ local KNOWN_CODES = {
 local BUCKET_PATTERNS = {
     raid    = { "bribe", "raid", "police", "officer", "fine", "pay off", "bail" },
     photo   = { "photo", "qc", "camera", "shoot", "snapshot", "quality", "capture" },
-    order   = { "order", "process", "pack", "label", "sort", "fulfil", "fulfill" },
+    order   = { "order", "process", "pack", "label", "sort", "fulfil", "fulfill",
+                "packing", "prep", "pick pack", "qc check" },
     ship    = { "ship", "haul", "deliver", "dispatch", "send", "van", "truck", "depart" },
     collect = { "collect", "cash", "money", "claim", "earn", "pickup", "pick up",
                 "revenue", "offline", "sale", "sell", "income", "payout", "next" },
     hire    = { "hire", "employ", "recruit", "staff", "worker" },
     crate   = { "crate", "unbox", "spin", "roll", "gacha" },
+    reward  = { "daily", "free", "bonus", "gift", "wheel", "login", "chest",
+                "reward" },
 }
 
-local BUCKET_ORDER = { "raid", "photo", "order", "ship", "collect", "hire", "crate" }
+local BUCKET_ORDER = { "raid", "photo", "order", "ship", "collect", "reward",
+                        "hire", "crate" }
 
 local WORKFLOW_EXCLUDE = {
     "robux", "purchase", "buy", "gamepass", "shop", "store", "cancel", "close",
     "delete", "settings", "social", "group", "codes", "redeem", "inventory",
     "equip", "roblox", "premium", "avatar",
 }
+
+local GATED_PATTERNS = {
+    "robux", "r$", "buy now", "gamepass", "get pass", "own this",
+}
+
+local CONFIRM_EXACT = {
+    ok = true, yes = true, done = true, sure = true, yep = true, go = true,
+}
+local CONFIRM_SUBSTR = { "confirm", "continue", "proceed", "accept" }
 
 local Config = {
     ScanInterval      = 2.0,
@@ -110,9 +163,11 @@ local Config = {
 
 local State = {
     Running   = true,
+    Paused    = false,
     Base      = nil,
     BaseWhy   = "scanning...",
-    Targets   = { photo={}, order={}, ship={}, collect={}, hire={}, crate={}, raid={} },
+    Targets   = { photo={}, order={}, ship={}, collect={}, hire={}, crate={},
+                  raid={}, reward={} },
     ScanAt    = 0,
     ScanCount = 0,
     Busy      = false,
@@ -122,6 +177,13 @@ local State = {
     SpeedApplied = false,
     SavedSpeed = 16,
     LastTeleport = 0,
+    StartedAt = 0,
+    LastRaidToast = 0,
+    ConfirmUntil = 0,
+    ConfirmBucket = nil,
+    LastGuiClick = nil,
+    LastGuiClickAt = 0,
+    LastPromptWatch = 0,
     Features = {
         photo   = true,
         order   = true,
@@ -129,12 +191,15 @@ local State = {
         collect = true,
         hire    = false,
         crate   = false,
+        reward  = true,
         raid    = true,
         speed   = false,
         tp      = true,
         antiafk = true,
+        autocodes = false,
     },
-    Stats = { photos=0, orders=0, ships=0, collected=0, hired=0, bribed=0, crates=0 },
+    Stats = { photos=0, orders=0, ships=0, collected=0, hired=0, bribed=0,
+              crates=0, rewards=0 },
     Counts = { prompt=0, click=0, key=0, gui=0 },
 }
 
@@ -170,6 +235,67 @@ local function setStatus(text)
     end
 end
 
+local toastSeq = 0
+local function toast(text)
+    if not Gui or not Gui.Toast then return end
+    toastSeq = toastSeq + 1
+    local my = toastSeq
+    Gui.Toast.Text = text
+    Gui.Toast.Visible = true
+    task.delay(3.5, function()
+        if toastSeq == my and Gui and Gui.Toast and Gui.Toast.Parent then
+            pcall(function()
+                Gui.Toast.Visible = false
+            end)
+        end
+    end)
+end
+
+local SETTINGS_FILE = "ChinaSideAutoHub_settings.txt"
+
+local settingsWarned = false
+local function warnSettings()
+    if not settingsWarned then
+        settingsWarned = true
+        addLog("settings: this executor has no writefile/readfile — toggles won't persist")
+    end
+end
+
+local function saveSettings()
+    local ok = pcall(function()
+        local lines = {}
+        for key, value in pairs(State.Features) do
+            lines[#lines + 1] = key .. "=" .. (value and "1" or "0")
+        end
+        lines[#lines + 1] = "paused=" .. (State.Paused and "1" or "0")
+        writefile(SETTINGS_FILE, table.concat(lines, "\n"))
+    end)
+    if not ok then warnSettings() end
+end
+
+local function loadSettings()
+    local ok = pcall(function()
+        local data = readfile(SETTINGS_FILE)
+        if type(data) ~= "string" then return end
+        local loaded = 0
+        for line in data:gmatch("[^\n]+") do
+            local key, value = line:match("^([%w_]+)=([01])")
+            if key then
+                if key == "paused" then
+                    State.Paused = value == "1"
+                elseif State.Features[key] ~= nil then
+                    State.Features[key] = value == "1"
+                    loaded = loaded + 1
+                end
+            end
+        end
+        if loaded > 0 then
+            addLog(("settings: restored %d toggles"):format(loaded))
+        end
+    end)
+    if not ok then warnSettings() end
+end
+
 local function safeCall(fn, ...)
     local ok, err = pcall(fn, ...)
     if not ok then
@@ -202,6 +328,29 @@ local function matchAny(text, patterns)
     return false
 end
 
+local function buttonText(d)
+    local text = ""
+    if d:IsA("TextButton") or d:IsA("TextLabel") then
+        text = lower(d.Text)
+    end
+    if text == "" or text == "button" then
+        local parts = {}
+        for _, child in ipairs(d:GetDescendants()) do
+            if child:IsA("TextLabel") and child.Visible and lower(child.Text) ~= "" then
+                parts[#parts + 1] = lower(child.Text)
+            end
+        end
+        if #parts > 0 then
+            text = text .. " " .. table.concat(parts, " ")
+        end
+    end
+    return (text .. " " .. lower(d.Name)):gsub("%s+", " ")
+end
+
+local function isGated(text)
+    return matchAny(text, GATED_PATTERNS)
+end
+
 local function inHubGui(inst)
     local node = inst
     while node and node ~= game do
@@ -218,6 +367,14 @@ local function bucketForText(text)
         end
     end
     return nil
+end
+
+local function isConfirmText(text)
+    text = lower(text):gsub("^%s+", ""):gsub("%s+$", "")
+    if text == "" or #text > 14 then return false end
+    if isGated(text) or matchAny(text, WORKFLOW_EXCLUDE) then return false end
+    if bucketForText(text) then return false end
+    return CONFIRM_EXACT[text] ~= nil or matchAny(text, CONFIRM_SUBSTR)
 end
 
 --------------------------------------------------------------------------------
@@ -396,7 +553,8 @@ local function rescanTargets()
             local text = lower(table.concat({
                 tostring(d.Name), tostring(d.ActionText), tostring(d.ObjectText) }, " "))
             local bucket = bucketForText(text)
-            if bucket and inBaseScope(d) then
+            if bucket and not matchAny(text, WORKFLOW_EXCLUDE)
+                and not isGated(text) and inBaseScope(d) then
                 local range = math.clamp((d.MaxActivationDistance or 10) + 2, 6, 18)
                 worldRecords[#worldRecords + 1] = addRecord(bucket, "prompt", d, range)
             end
@@ -412,14 +570,16 @@ local function rescanTargets()
                     end
                 end
                 local bucket = bucketForText(text)
-                if bucket and inBaseScope(parent) then
+                if bucket and not matchAny(text, WORKFLOW_EXCLUDE)
+                    and not isGated(text) and inBaseScope(parent) then
                     local range = math.clamp((d.MaxActivationDistance or 32) + 3, 8, 20)
                     worldRecords[#worldRecords + 1] = addRecord(bucket, "click", parent, range)
                 end
             end
         elseif d:IsA("BasePart") and stationPartFilter(d.Name) and inBaseScope(d) then
             local bucket = bucketForText(d.Name)
-            if bucket then
+            if bucket and not matchAny(d.Name, WORKFLOW_EXCLUDE)
+                and not isGated(d.Name) then
                 worldRecords[#worldRecords + 1] = addRecord(bucket, "key", d, 9)
             end
         end
@@ -462,13 +622,21 @@ local function rescanTargets()
             if gui:IsA("ScreenGui") and gui.Name ~= HUB_NAME and gui.Enabled then
                 for _, d in ipairs(gui:GetDescendants()) do
                     if (d:IsA("TextButton") or d:IsA("ImageButton")) and guiVisible(d) then
-                        local text = d:IsA("TextButton")
-                            and (lower(d.Text) .. " " .. lower(d.Name))
-                            or lower(d.Name)
-                        if not matchAny(text, WORKFLOW_EXCLUDE) then
+                        local own = d:IsA("TextButton") and lower(d.Text) or ""
+                        local text = buttonText(d)
+                        if not matchAny(text, WORKFLOW_EXCLUDE)
+                            and not isGated(own) and not isGated(lower(d.Name)) then
                             local bucket = bucketForText(text)
                             if bucket then
-                                addRecord(bucket, "gui", d, 0)
+                                local rec = addRecord(bucket, "gui", d, 0)
+                                local okSize, size = pcall(function()
+                                    return d.AbsoluteSize
+                                end)
+                                if okSize and typeof(size) == "Vector2" then
+                                    rec.score = math.max(1, size.X * size.Y)
+                                else
+                                    rec.score = 1
+                                end
                             end
                         end
                     end
@@ -479,7 +647,9 @@ local function rescanTargets()
 
     for _, list in pairs(State.Targets) do
         table.sort(list, function(a, b)
-            return distanceTo(a.inst) < distanceTo(b.inst)
+            local aKey = a.kind == "gui" and -(a.score or 1) or distanceTo(a.inst)
+            local bKey = b.kind == "gui" and -(b.score or 1) or distanceTo(b.inst)
+            return aKey < bKey
         end)
     end
 
@@ -609,9 +779,43 @@ local function screenCenter(obj)
     return Vector2.new(pos.X + size.X / 2, pos.Y + size.Y / 2)
 end
 
+local function scrollIntoView(obj)
+    local node = obj.Parent
+    while node and node ~= game do
+        if node:IsA("ScrollingFrame") then
+            pcall(function()
+                local fPos = node.AbsolutePosition
+                local fSize = node.AbsoluteSize
+                local oPos = obj.AbsolutePosition
+                local oSize = obj.AbsoluteSize
+                local top = oPos.Y - fPos.Y
+                local bottom = top + oSize.Y
+                local dy = 0
+                if top < 0 then
+                    dy = top - 6
+                elseif bottom > fSize.Y then
+                    dy = bottom - fSize.Y + 6
+                end
+                if dy ~= 0 then
+                    local canvas = node.CanvasPosition
+                    node.CanvasPosition = Vector2.new(canvas.X,
+                        math.max(0, canvas.Y + dy))
+                end
+            end)
+            return true
+        end
+        node = node.Parent
+    end
+    return false
+end
+
 local function uiClick(obj)
     if not obj or not obj.Parent then return false end
     if not guiVisible(obj) then return false end
+    local scrolled = scrollIntoView(obj)
+    if scrolled then
+        task.wait(0.08)
+    end
     local ok, center = pcall(screenCenter, obj)
     if not ok then return false end
     if center.X == 0 and center.Y == 0 then return false end
@@ -625,18 +829,146 @@ local function uiClick(obj)
     return uiClickAt(center.X, center.Y)
 end
 
-local function pressInteractKey()
-    local focusOk, focused = pcall(function()
-        return GuiService:GetFocusedTextBox()
-    end)
-    if focusOk and focused then return false end
+local function sendKey(keyCode, requireNoFocus)
+    if requireNoFocus then
+        local focusOk, focused = pcall(function()
+            return GuiService:GetFocusedTextBox()
+        end)
+        if focusOk and focused then return false end
+    end
     if not vimAvailable() then return false end
     local ok = pcall(function()
-        VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game, 1)
+        VirtualInputManager:SendKeyEvent(true, keyCode, false, game, 1)
         task.wait(0.05)
-        VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game, 1)
+        VirtualInputManager:SendKeyEvent(false, keyCode, false, game, 1)
     end)
     return ok
+end
+
+local function pressInteractKey()
+    return sendKey(Enum.KeyCode.E, true)
+end
+
+local CANCEL_TEXT = {
+    ["cancel"] = true, ["no thanks"] = true, ["not now"] = true,
+    ["never mind"] = true, ["no, thanks"] = true, ["x"] = true,
+    ["close"] = true, ["no"] = true,
+}
+
+local lastPromptLog = 0
+local lastPromptAct = 0
+local lastGatedLog = 0
+local escapeArmedAt = 0
+
+local function findPromptNode(node, depth)
+    if depth > 14 then return nil end
+    if node:IsA("GuiObject") and node.Visible == false then return nil end
+    if node:IsA("LayerCollector") and node.Enabled == false then return nil end
+    local n = lower(node.Name)
+    if string.find(n, "purchaseprompt", 1, true)
+        or string.find(n, "robloxprompt", 1, true)
+        or (string.find(n, "prompt", 1, true)
+            and (string.find(n, "purchase", 1, true)
+                or string.find(n, "robux", 1, true)
+                or string.find(n, "gamepass", 1, true)
+                or string.find(n, "buy", 1, true))) then
+        return node
+    end
+    for _, child in ipairs(node:GetChildren()) do
+        local found = findPromptNode(child, depth + 1)
+        if found then return found end
+    end
+    return nil
+end
+
+local function runPurchaseGuard()
+    if now() - State.LastPromptWatch < 0.4 then return end
+    State.LastPromptWatch = now()
+
+    local roots = {}
+    local okCore, coreGui = pcall(function()
+        return game:GetService("CoreGui")
+    end)
+    if okCore and coreGui then roots[#roots + 1] = coreGui end
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if playerGui then roots[#roots + 1] = playerGui end
+
+    local prompt = nil
+    for _, root in ipairs(roots) do
+        local ok, found = pcall(findPromptNode, root, 0)
+        if ok and found then
+            prompt = found
+            break
+        end
+    end
+    if not prompt then return end
+
+    if now() - lastPromptAct < 1.2 then return end
+    lastPromptAct = now()
+
+    local clicked = false
+    pcall(function()
+        for _, d in ipairs(prompt:GetDescendants()) do
+            if clicked then return end
+            if (d:IsA("TextButton") or d:IsA("ImageButton"))
+                and guiVisible(d) then
+                local t = d:IsA("TextButton") and lower(d.Text):gsub("^%s+", "")
+                    :gsub("%s+$", "") or ""
+                if CANCEL_TEXT[t] == true and not isGated(t) then
+                    if uiClick(d) then clicked = true end
+                end
+            end
+        end
+    end)
+    if not clicked and now() - escapeArmedAt > 6 then
+        escapeArmedAt = now()
+        sendKey(Enum.KeyCode.Escape, false)
+    end
+
+    if State.LastGuiClick and State.LastGuiClick.Parent
+        and now() - State.LastGuiClickAt < 5 then
+        State.Cooldowns[State.LastGuiClick] = now() + 90
+        if now() - lastGatedLog > 8 then
+            lastGatedLog = now()
+            addLog("gated: button wants a gamepass — shelved 90s, "
+                .. "continuing on free paths")
+        end
+        State.LastGuiClick = nil
+    end
+    if now() - lastPromptLog > 8 then
+        lastPromptLog = now()
+        addLog("purchase prompt cancelled — nothing bought")
+        toast("Purchase prompt closed")
+    end
+end
+
+local function runConfirmClick()
+    if now() > State.ConfirmUntil or not State.ConfirmBucket then return end
+    if not State.Features[State.ConfirmBucket] then return end
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return end
+    local statKey = STAT_KEYS[State.ConfirmBucket]
+    for _, gui in ipairs(playerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Name ~= HUB_NAME and gui.Enabled then
+            for _, d in ipairs(gui:GetDescendants()) do
+                if d:IsA("TextButton") and guiVisible(d)
+                    and now() >= (State.Cooldowns[d] or 0) then
+                    local t = lower(d.Text)
+                    if isConfirmText(t) and uiClick(d) then
+                        State.Cooldowns[d] = now() + 3
+                        if statKey then
+                            State.Stats[statKey] = State.Stats[statKey] + 1
+                        end
+                        addLog(("confirm: clicked \"%s\" (%s)"):format(
+                            t, State.ConfirmBucket))
+                        State.ConfirmUntil = 0
+                        State.ConfirmBucket = nil
+                        return
+                    end
+                end
+            end
+        end
+    end
 end
 
 local function clickWorldPart(part)
@@ -775,6 +1107,10 @@ local function runTarget(bucket, statKey, label)
                 State.Cooldowns["__" .. bucket] = now() +
                     (bucket == "raid" and 2 or Config.PromptCooldown)
                 State.Stats[statKey] = State.Stats[statKey] + 1
+                if now() > State.ConfirmUntil then
+                    State.ConfirmUntil = now() + 4
+                    State.ConfirmBucket = bucket
+                end
                 if mode == "key" then
                     addLog(label .. " #" .. State.Stats[statKey] .. " (E key)")
                 else
@@ -795,13 +1131,19 @@ local function runTarget(bucket, statKey, label)
     end
 
     local list = State.Targets[bucket]
-    if list then
+    if list and now() >= State.ConfirmUntil then
         for _, rec in ipairs(list) do
             if rec.kind == "gui" and rec.inst.Parent and guiVisible(rec.inst)
                 and now() >= (State.Cooldowns[rec.inst] or 0) then
                 if uiClick(rec.inst) then
                     State.Cooldowns[rec.inst] = now() + Config.GuiTargetCooldown
                     State.Stats[statKey] = State.Stats[statKey] + 1
+                    if now() > State.ConfirmUntil then
+                        State.ConfirmUntil = now() + 4
+                        State.ConfirmBucket = bucket
+                    end
+                    State.LastGuiClick = rec.inst
+                    State.LastGuiClickAt = now()
                     addLog(label .. " (gui) #" .. State.Stats[statKey])
                     return
                 else
@@ -867,6 +1209,8 @@ local function runRaid()
     findGuiObjects()
     if State.GuiParts.bribe and now() >= (State.Cooldowns["__raidui"] or 0) then
         if uiClick(State.GuiParts.bribe) then
+            State.LastGuiClick = State.GuiParts.bribe
+            State.LastGuiClickAt = now()
             State.Stats.bribed = State.Stats.bribed + 1
             addLog("raid: clicked bribe button")
             State.Cooldowns["__raidui"] = now() + 3
@@ -881,6 +1225,10 @@ local function runRaid()
         Nav.Until = now() + Config.MoveTimeout
         State.Cooldowns["__raid"] = now() + 2
         addLog("raid detected: heading to bribe")
+        if now() - (State.LastRaidToast or 0) > 15 then
+            State.LastRaidToast = now()
+            toast("RAID detected — bribing!")
+        end
     end
 end
 
@@ -1018,18 +1366,25 @@ redeemCodesImpl = function()
             if not clicked then
                 clicked = clickMatching({ "redeem" }, "redeem button")
             end
+            if not clicked then
+                sendKey(Enum.KeyCode.Return, false)
+            end
             task.wait(0.5)
             done = done + 1
         end
     end
     releaseBox()
-    addLog(("codes: attempted %d/%d (watch for cash/boost notifications)"):format(done, #KNOWN_CODES))
+    local msg = ("codes: attempted %d/%d (watch for cash/boost notifications)"):format(done, #KNOWN_CODES)
+    addLog(msg)
+    toast(msg)
     return true
 end
 
 local function bribeNow()
     findGuiObjects()
     if State.GuiParts.bribe and uiClick(State.GuiParts.bribe) then
+        State.LastGuiClick = State.GuiParts.bribe
+        State.LastGuiClickAt = now()
         State.Stats.bribed = State.Stats.bribed + 1
         addLog("bribe: clicked on demand")
         return true
@@ -1047,6 +1402,7 @@ local function bribeNow()
             return false
         else
             State.Features.raid = true
+            saveSettings()
             clearNav()
             Nav.Record = target
             Nav.Until = now() + Config.MoveTimeout
@@ -1162,8 +1518,8 @@ local function buildGui()
 
     local main = mk("Frame", {
         Name = "Main",
-        Size = UDim2.fromOffset(320, 560),
-        Position = UDim2.new(0, 24, 0.5, -280),
+        Size = UDim2.fromOffset(320, 640),
+        Position = UDim2.new(0, 24, 0.5, -320),
         BackgroundColor3 = COLORS.bg,
         BorderSizePixel = 0,
         Active = true,
@@ -1171,6 +1527,23 @@ local function buildGui()
     }, screen)
     mk("UICorner", { CornerRadius = UDim.new(0, 10) }, main)
     mk("UIStroke", { Color = Color3.fromRGB(50, 55, 68), Thickness = 1 }, main)
+
+    local toastLabel = mk("TextLabel", {
+        Name = "Toast",
+        AnchorPoint = Vector2.new(0.5, 0),
+        Position = UDim2.new(0.5, 0, 0, 14),
+        Size = UDim2.fromOffset(360, 36),
+        BackgroundColor3 = COLORS.accent,
+        Font = Enum.Font.GothamBold,
+        Text = "",
+        TextSize = 13,
+        TextColor3 = COLORS.text,
+        TextWrapped = true,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 20,
+    }, screen)
+    mk("UICorner", { CornerRadius = UDim.new(0, 8) }, toastLabel)
 
     local header = mk("Frame", {
         Size = UDim2.new(1, 0, 0, 44),
@@ -1186,7 +1559,7 @@ local function buildGui()
     }, header)
 
     mk("TextLabel", {
-        Size = UDim2.new(1, -60, 1, 0),
+        Size = UDim2.new(1, -140, 1, 0),
         Position = UDim2.new(0, 14, 0, 0),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
@@ -1196,18 +1569,24 @@ local function buildGui()
         TextXAlignment = Enum.TextXAlignment.Left,
     }, header)
 
-    local closeBtn = mk("TextButton", {
-        Size = UDim2.fromOffset(30, 30),
-        Position = UDim2.new(1, -36, 0, 7),
-        BackgroundColor3 = COLORS.off,
-        Font = Enum.Font.GothamBold,
-        Text = "X",
-        TextSize = 13,
-        TextColor3 = COLORS.text,
-        BorderSizePixel = 0,
-        AutoButtonColor = true,
-    }, header)
-    mk("UICorner", { CornerRadius = UDim.new(0, 6) }, closeBtn)
+    local function headerButton(text, xOffset, size)
+        local b = mk("TextButton", {
+            Size = UDim2.fromOffset(size, 30),
+            Position = UDim2.new(1, xOffset, 0, 7),
+            BackgroundColor3 = COLORS.off,
+            Font = Enum.Font.GothamBold,
+            Text = text,
+            TextSize = 13,
+            TextColor3 = COLORS.text,
+            BorderSizePixel = 0,
+            AutoButtonColor = true,
+        }, header)
+        mk("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+        return b
+    end
+    local pauseBtn = headerButton(State.Paused and "▶" or "||", -72, 30)
+    local minBtn = headerButton("_", -106, 30)
+    local closeBtn = headerButton("X", -36, 30)
 
     local statusLabel = mk("TextLabel", {
         Name = "Status",
@@ -1226,7 +1605,7 @@ local function buildGui()
 
     local listFrame = mk("ScrollingFrame", {
         Name = "List",
-        Size = UDim2.new(1, -24, 0, 268),
+        Size = UDim2.new(1, -24, 0, 360),
         Position = UDim2.new(0, 12, 0, 94),
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
@@ -1246,9 +1625,11 @@ local function buildGui()
         { key = "order",   label = "Auto Process Orders" },
         { key = "ship",    label = "Auto Ship Hauls" },
         { key = "collect", label = "Auto Collect Cash" },
+        { key = "reward",  label = "Auto Free Rewards" },
         { key = "hire",    label = "Auto Hire Staff" },
         { key = "crate",   label = "Auto Open Crates" },
         { key = "raid",    label = "Auto Raid Bribe" },
+        { key = "autocodes", label = "Auto Codes on Join" },
         { key = "tp",      label = "Teleport to Stations" },
         { key = "speed",   label = ("Walk Speed (%d)"):format(Config.WalkSpeed) },
         { key = "antiafk", label = "Anti-AFK" },
@@ -1294,7 +1675,7 @@ local function buildGui()
 
     local actionRow = mk("Frame", {
         Size = UDim2.new(1, -24, 0, 30),
-        Position = UDim2.new(0, 12, 0, 370),
+        Position = UDim2.new(0, 12, 0, 462),
         BackgroundTransparency = 1,
     }, main)
     mk("UIListLayout", {
@@ -1327,20 +1708,21 @@ local function buildGui()
 
     local statsLabel = mk("TextLabel", {
         Name = "Stats",
-        Size = UDim2.new(1, -24, 0, 18),
-        Position = UDim2.new(0, 12, 0, 406),
+        Size = UDim2.new(1, -24, 0, 30),
+        Position = UDim2.new(0, 12, 0, 498),
         BackgroundTransparency = 1,
         Font = Enum.Font.Code,
         Text = "",
-        TextSize = 11,
+        TextSize = 10,
         TextColor3 = COLORS.dim,
         TextXAlignment = Enum.TextXAlignment.Left,
+        TextWrapped = true,
     }, main)
 
     local logLabel = mk("TextLabel", {
         Name = "Log",
-        Size = UDim2.new(1, -24, 0, 128),
-        Position = UDim2.new(0, 12, 0, 428),
+        Size = UDim2.new(1, -24, 0, 104),
+        Position = UDim2.new(0, 12, 0, 534),
         BackgroundColor3 = COLORS.panel,
         Font = Enum.Font.Code,
         Text = "",
@@ -1359,8 +1741,13 @@ local function buildGui()
         Status = statusLabel,
         Log = logLabel,
         Stats = statsLabel,
+        Toast = toastLabel,
         Actions = actions,
         Close = closeBtn,
+        Pause = pauseBtn,
+        Min = minBtn,
+        Body = { statusLabel, listFrame, actionRow, statsLabel, logLabel },
+        Minimized = false,
     }
 
     local drag, dragStart, startPos
@@ -1395,6 +1782,20 @@ local function buildGui()
     return screen
 end
 
+local function togglePause()
+    State.Paused = not State.Paused
+    if Gui and Gui.Pause and Gui.Pause.Parent then
+        Gui.Pause.Text = State.Paused and "▶" or "||"
+        Gui.Pause.BackgroundColor3 = State.Paused and COLORS.accent or COLORS.off
+    end
+    toast(State.Paused and "PAUSED" or "RESUMED")
+    addLog(State.Paused and "paused" or "resumed")
+    if State.Paused then
+        clearNav()
+    end
+    saveSettings()
+end
+
 local function bindGui()
     for key, btn in pairs(toggles) do
         btn.Activated:Connect(function()
@@ -1405,6 +1806,7 @@ local function bindGui()
                 if humanoid then humanoid.WalkSpeed = State.SavedSpeed end
                 State.SpeedApplied = false
             end
+            saveSettings()
         end)
     end
     Gui.Actions.SCAN.Activated:Connect(function()
@@ -1442,6 +1844,19 @@ local function bindGui()
             Gui.Screen.Enabled = not Gui.Screen.Enabled
         end
     end)
+    Gui.Pause.Activated:Connect(function()
+        togglePause()
+    end)
+    Gui.Min.Activated:Connect(function()
+        if not Gui or not Gui.Main then return end
+        Gui.Minimized = not Gui.Minimized
+        for _, el in ipairs(Gui.Body) do
+            el.Visible = not Gui.Minimized
+        end
+        Gui.Main.Size = Gui.Minimized and UDim2.fromOffset(320, 44)
+            or UDim2.fromOffset(320, 640)
+        Gui.Min.Text = Gui.Minimized and "+" or "_"
+    end)
 end
 
 --------------------------------------------------------------------------------
@@ -1454,12 +1869,24 @@ local function updateStatsText()
         dot.BackgroundColor3 = State.Features[key] and COLORS.on or COLORS.off
     end
     local s = State.Stats
-    Gui.Stats.Text = ("photos %d  orders %d  ships %d  cash %d  hired %d  bribes %d  crates %d"):format(
-        s.photos, s.orders, s.ships, s.collected, s.hired, s.bribed, s.crates)
+    local elapsed = math.max(0, math.floor(now() - (State.StartedAt > 0 and State.StartedAt or now())))
+    local mm = math.floor(elapsed / 60)
+    local ss = elapsed % 60
+    Gui.Stats.Text = ("photos %d orders %d ships %d cash %d rewards %d\nhired %d bribes %d crates %d run %d:%02d"):format(
+        s.photos, s.orders, s.ships, s.collected, s.rewards,
+        s.hired, s.bribed, s.crates, mm, ss)
 end
 
 local function tick()
     if not State.Running then return end
+
+    safeCall(runPurchaseGuard)
+
+    if State.Paused then
+        setStatus("PAUSED — press ▶ or F6 to resume")
+        updateStatsText()
+        return
+    end
 
     local character = getCharacter()
     local humanoid = getHumanoid()
@@ -1478,6 +1905,7 @@ local function tick()
 
     if not State.Busy then
         safeCall(runRaid)
+        safeCall(runConfirmClick)
 
         for _, bucket in ipairs(BUCKET_ORDER) do
             safeCall(runTarget, bucket, STAT_KEYS[bucket], bucket:upper())
@@ -1521,6 +1949,14 @@ local function onCharacterAdded(character)
         task.delay(1, function()
             safeCall(rescanTargets)
         end)
+        if State.Features.autocodes and not State.Paused then
+            task.delay(6, function()
+                if State.Running and State.Features.autocodes and not State.Paused then
+                    addLog("auto-codes: redeeming on join")
+                    safeCall(redeemCodes)
+                end
+            end)
+        end
     end
 end
 
@@ -1529,6 +1965,9 @@ local function start()
         addLog(("warning: place %s is not ChinaSide Tycoon (%s)")
             :format(tostring(game.PlaceId), tostring(PLACE_ID)))
     end
+
+    State.StartedAt = now()
+    loadSettings()
 
     local runStamp = tostring(now())
     pcall(function()
@@ -1563,15 +2002,24 @@ local function start()
 
     buildGui()
     bindGui()
+    if State.Paused and Gui and Gui.Pause then
+        Gui.Pause.Text = "▶"
+        Gui.Pause.BackgroundColor3 = COLORS.accent
+    end
 
-    addLog("ChinaSide Auto Hub v1.1 loaded")
+    addLog("ChinaSide Auto Hub v1.3 loaded")
     addLog(("place=%s player=%s"):format(tostring(game.PlaceId), LocalPlayer.Name))
+    addLog("keys: RIGHT SHIFT show/hide · F6 pause · F8 codes")
 
     safeCall(rescanTargets)
     safeCall(findGuiObjects)
 
     if LocalPlayer.Character then
-        onCharacterAdded(LocalPlayer.Character)
+        task.spawn(function()
+            if LocalPlayer.Character then
+                onCharacterAdded(LocalPlayer.Character)
+            end
+        end)
     end
     table.insert(Connections, LocalPlayer.CharacterAdded:Connect(onCharacterAdded))
 
@@ -1587,11 +2035,15 @@ local function start()
     end))
 
     local accumulator = 0
+    local tickRunning = false
     table.insert(Connections, RunService.Heartbeat:Connect(function(dt)
         accumulator = accumulator + dt
         if accumulator >= Config.TickRate then
             accumulator = 0
+            if tickRunning then return end
+            tickRunning = true
             local ok, err = pcall(tick)
+            tickRunning = false
             if not ok then
                 addLog("tick error: " .. tostring(err))
             end
@@ -1604,10 +2056,17 @@ local function start()
             if Gui and Gui.Screen then
                 Gui.Screen.Enabled = not Gui.Screen.Enabled
             end
+        elseif input.KeyCode == Enum.KeyCode.F6 then
+            togglePause()
+        elseif input.KeyCode == Enum.KeyCode.F8 then
+            task.spawn(function()
+                safeCall(redeemCodes)
+            end)
         end
     end))
 
-    setStatus("loaded — press RIGHT SHIFT to show/hide")
+    setStatus("loaded — RIGHT SHIFT show/hide · F6 pause")
+    toast("ChinaSide Auto Hub v1.3 loaded")
 end
 
 safeCall(start)
